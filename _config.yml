@@ -41,5 +41,5 @@ defaults:
     values:
       tags: Other
       
- permalink: /blog/:year/:month/:day/:title
+permalink: /blog/:year/:month/:day/:title
  
