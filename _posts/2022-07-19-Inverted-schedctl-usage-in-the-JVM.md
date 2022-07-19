@@ -8,6 +8,6 @@ We'll now switch topics to the implementation of the "synchronized" locking cons
 
 One annoyance is that the schedctl blocks for the threads in a given process are tightly packed on special pages mapped from kernel space into user-land. As such, writes to the schedctl blocks can cause false sharing on other adjacent blocks.   Hopefully the kernel folks will make changes to avoid this by padding and aligning the blocks to ensure that one cache line underlies at most one schedctl block at any one time.   It's vaguely ironic that a facility designed to improve cooperation between threads suffers from false sharing. 
 
-Schedctl also exposes a thread's scheduling state. So if thread T2 holds a lock L, and T1 is contending for L, T1 can check T2's state to see whether it's running  (*ONPROC* in Solaris terminology), ready, or blocked.   If T2 is not running then it's usually prudent for T1 to park instead of continuing to spin, as the spin attempt is much more likely to be futile. 
+Schedctl also exposes a thread's scheduling state. So if thread T2 holds a lock L, and T1 is contending for L, T1 can check T2's state to see whether it's running  (**ONPROC** in Solaris terminology), ready, or blocked.   If T2 is not running then it's usually prudent for T1 to park instead of continuing to spin, as the spin attempt is much more likely to be futile. 
 
 
