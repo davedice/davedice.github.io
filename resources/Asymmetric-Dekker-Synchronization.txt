@@ -1,0 +1,3041 @@
+
+Asymmetric Dekker Synchronization
+=================================
+
+Authors : Dave Dice, Hui Huang, Mingyao Yang.  
+Incept  : July, 2001
+Filing  : SUN040896 - accession number
+Patent  : US07644409
+Last updated: (Bibliography, August 2006)
+Moved to blogs.oracle.com/dave November 2013 
+
+Abstract
+~~~~~~~~
+
+We describe an inter-thread synchronization mechanism that is based on simple 
+memory loads, stores the following capability
+
+    the ability of a thread to serialize the execution of another thread
+    running on another processor.  Serialization forces (or waits for) any
+    pending stores to become visible to other processors.  In one 
+    embodiment we use the page-level memory protection provided by the 
+    underlying operating system and memory management unit.  Instead of 
+    requiring costly memory barrier instructions between stores and loads 
+    as is typical of current designs we replace the explicit memory barrier
+    instruction with a store to a potentially-excepting page. 
+
+Our mechanism is appropriate for applications that exhibit *asymmetric* 
+synchronization patterns where one thread or group of threads frequently 
+needs to synchronize with a second group of threads but threads in the second 
+group rarely need to synchronize with threads in the 1st group.  
+
+Background
+~~~~~~~~~~
+
+Broadly, we can define "synchronization" as a mechanism that prevents, avoids or
+recovers from the inopportune interleavings of concurrent operations.  Such 
+inopportune interleavings are commonly called "races".  Mutual exclusion is a 
+special case of synchronization where at most one thread is permitted 
+access to protected code or data at any given time.
+
+On typical symmetric-multiprocessor "SMP" systems threads usually communicate
+and synchronize through shared memory.  Threads commonly use the following
+primitives:
+
+1.  Atomic instructions
+
+    Modern processors provide atomic instructions such as compare-and-swap (CAS), 
+    load-locked and store-conditional, exchange and fetch-and-add.  See [1] 
+    for a description of CAS.  The Intel IA32 architecture provides CAS under 
+    the name "cmpxchg".
+
+    Synchronization based on atomic instructions is very common in
+    modern multithreaded software, such as Java.  Unfortunately the CAS 
+    instruction is relatively slow compared to other instructions, typically 
+    requiring 50-200 cycles to complete.
+
+2.  Simple load-store operations to shared-memory variables
+
+    Classic examples of load-store based synchronization mechanisms include
+    Dekker, Dijkstra, Lamport, and Peterson.   Dekker was the first to devise
+    a mutual exclusion protocol for two threads implemented just with
+    load and store operations.  See [5] for an excellent survey of load-store 
+    based synchronization mechanisms.   
+
+    If thread #1 wishes to synchronize its execution with thread #2, the
+    threads will employ the following protocol to enter a critical section:
+
+    [Basic Dekker]
+
+      Thread1:
+        // Ingress 
+        Store (ST) 1 into memory variable T1  -- publish intention to enter CS
+        Load  (LD) from memory variable T2    -- ratify no collision with Thread2
+        if the value fetched from T2 is non-zero, clear T1 and retry
+        <CRITIALSECTION>
+        // Egress
+        ST T1 = 0                             -- release lock
+
+      Thread2:
+        // Ingress 
+        ST 1 into memory variable T2          -- announce intention to enter CS
+        LD from memory variable T1            -- ratify no collision with Thread1
+        if the value fetched from T1 is non-zero, clear T2 and retry.
+        <CRITIALSECTION>
+        // Egress
+        ST T2 = 0                             -- release lock
+
+        Variables T1 and T2 are initially 0. 
+
+    Of course this simplified form is vulnerable to "livelock" where
+    both Thread1 and Thread2 attempt to enter the critical section
+    simultaneously and then perpetually spin, retrying.  In practice
+    we augment the mutual exclusion mechanism with additional logic
+    so that the threads take turns, ensuring progress.  
+
+    Critically, there is a duality between the actions of the threads: 
+    thread1 stores to T1 and then loads T2 while thread2 stores to T2 
+    and then loads from T1.  See [9], section J.9, "Dekker's Algorithm".  
+    We refer to the idiom as the "Dekker Duality" and the family
+    of such mechanisms as Dekker-based synchronization.  The ST-LD idiom
+    is common to all load-store mechanisms [6].
+    
+    Load-store mechanism have a lower _consensus_number_ [7] than 
+    atomics instructions.  Using CAS, for instance, we can synchronize
+    N threads using just one memory variable, but using store-load
+    synchronization N threads will require at least N distinct memory
+    variables. 
+
+Our proposed mutual exclusion mechanism is implemented with loads and stores
+and avoids using atomic instructions.  As noted above, the protocol to enter 
+a critical section involves a store followed by a load.  Complicating the issue,
+modern computer architectures often implement "weakened" or "relaxed" memory models.
+See [9], Section J, "Programming with Memory Models".  In a weakened memory model 
+the system is permitted to make the ST operation visible to other processors 
+after the LD completes.  That is, load and store operations executed on one 
+processor may be observed out-of-order by other processors.  This relaxation 
+of the memory model may allow certain optimizations in the design of the processor 
+or its interconnects, potentially improving the overall performance of the system. 
+
+A common memory model is Total-Store-Order, or TSO, which is implemented in all 
+SPARC processors.  The IA32 architecture implements the "Processor Ordering" (PO) 
+memory model, which is almost identical to TSO.  See [3]. In TSO, stores must 
+complete and become visible in the order executed by the processor, but if the 
+processor executes a store followed by a load the system may reorder the accesses,
+allowing the store to complete and become visible after the load finishes.  
+If we use a Dekker-like store-load mutual exclusion algorithm and the system 
+reorders the stores to be visible after the load, the Dekker algorithm can fail
+and permit two threads into a critical section at one time.  (This is referred 
+to as an exclusion failure and is extremely undesirable as the data protected by 
+the critical section can become inconsistent).  To avoid reordering the programmer
+must insert a "memory barrier" or MEMBAR instruction between the ST and the LD.  
+The MEMBAR instruction directs the processor to make the effect of the ST visible 
+before executing the LD.  Unfortunately the MEMBAR instruction is costly on SPARC 
+anid IA32 processors, often with a latency similar to that of atomic instructions such as 
+CAS.
+
+Reordering typically arises from out-of-order execution or by virtue of a processor's
+store buffer construct.  The store buffer is a per-processor LIFO buffer of pending 
+ST operations that have not yet been made visible to other processors.  A ST in 
+the store buffer is said to be pending or latent.   A MEMBAR instruction delays 
+execution until the issuing processor's store buffer drains to memory.  
+In addition, if the processor supports out-of-order or speculative execution, 
+speculation is not allowed to proceed past a MEMBAR.  Note that MEMBAR is a
+local operation in that it causes the issuing processor to synchronously drain
+its store buffer, but the MEMBAR is not visible and does not effect other
+processors in the system.  (A MEMBAR executed on one processor does not make 
+another processors pending stores visible).  
+
+The order in which a processor executes instructions is called *program order*.
+The order in which on processors's stores and loads become visible to other 
+processors is called memory order (or, equivalently, visibility order).  Because of 
+processor optimizations such as out-of-order execution and store buffers, memory order 
+can differ from store order.  A system is said to have a sequentially consistent (SC)
+memory model if memory order is always the same as visibility order.  SC is said to
+be the "strongest" memory model as no reorderings are permitted.  (A processor is
+always sequentially consistent with itself -- this property is referred to as 
+"processor consistency").  Programmers must insert MEMBAR (aka "FENCE") instructions 
+to prevent or control reordering.  The execution of a processor is said to be *serialized* 
+at a given point if the effects of all previously executed instructions in *program order* 
+are visible to other processors and the effects of any subsequent instructions that 
+might have started to execute speculatively have been cancelled.  On a SPARC TSO system 
+a MEMBAR serializes execution.  Exceptions (traps) also serialize execution.  
+
+Continuing with the example above, on a SPARC or IA32 multiprocessor system
+we need to add MEMBARs to make the Dekker algorithm operate correctly:
+
+    [Dekker with MEMBARs]
+    Thread1 would execute ST T1; MEMBAR; LD T2; test value ...
+    Thread2 would execute ST T2; MEMBAR; LD T1; test value ...
+
+Note that atomic instructions, such as CAS, and MEMBAR typically have
+long latencies and greatly degrade the throughput of the processor that
+executes such instructions.  
+
+
+The Key Innovation - Asymmetric Dekker Synchronization
+~~~~~~~~~~~~~~~~~~
+
+We now introduce a family of mechanisms that allow an implementation to use
+load-store synchronization but elide the expensive MEMBAR from the path used 
+by one of the synchronizing threads.  Our implementation is asymmetric -- we 
+eliminate the MEMBAR from the path used by Thread1 but to maintain safety and 
+correctness we add new code to the path used by Thread2 to cause Thread1 to 
+promptly and transiently (momentarily) serialize execution.  Conceptually, the 
+effect is as if Thread2 remotely caused Thread1 to execute and uncommanded MEMBAR, 
+even though a MEMBAR does not appear in Thread1's path of execution.  That is, 
+thread2 takes actions that cause Thread1 to momentarily make the effects of thread1's 
+instructions appear in-order and visible (to Thread2).  
+
+This mechanism is extremely efficient if Thread1 enters the critical section 
+proportionally more frequently than Thread2.  Borrowing from the example above, 
+we would change the mutual exclusion protocol to:
+
+    (Augmented Asymmetric Dekker)
+    Thread1 would execute ST T1; LD T2
+    Thread2 would execute ST T2; MEMBAR; SERIALIZE(Thread1); LD T1
+
+The SERIALIZE() operation executed by Thread2 forces Thread1 (or more
+precisely, the processor on which Thread1 is executing) to momentarily
+serialize execution.  We call Thread1 the "fast thread" as it avoids the 
+memory barrier and "Thread2" the "slow thread" as it requires a memory barrier
+and additional logic.  The SERIALIZE() primitive momentarily prevents Thread1 
+from reordering ST and LD operations.  In a sense we have shifted the 
+serialization burden from both threads, as is seen in the classic Dekker 
+with MEMBARs, to the slow thread.  Note that the SERIALIZE() primitive
+is synchronous - it doesn't return until the target thread has serialized
+and all prior stores issued by the target thread are visible to the the
+slow thread.  MEMBAR is a processor-local operation (accomplished entirely
+with in the processor executing the MEMBAR instruction), while SERIALIZE()
+has a momentary effect on the target processor.
+
+Note that Thread1 must either (a) avoid storing into T2, or, (b)
+if Thread1 stores into T2, Thread1 must execute an appropriate MEMBAR
+before entering the "ST T1;LD T2" sequence described above.  Failure
+to follow this convention could result in Thread1 storing into T2 and
+then having the subsequent "LD T2" be satisfied from the local store
+buffer instead of fetching the "fresh" value from memory.  Such a 
+scenario could result in loss of exclusions (failure).  
+
+Using the augmented Dekker form instead of the Dekker form with MEMBARs is 
+profitable if the following inequality holds:
+
+ (Thread1_iterations * COST(MEMBAR)) > (Thread2_iterations * COST(SERIALIZE)
+
+We have found we can improve the performance of a Java Virtual Machine (JVM) by 
+applying the augmented Dekker scheme to certain synchronization problems found 
+within the JVM.   We describe two applications -- Java monitors and JNI execution
+barriers:
+
+
+Java Monitors - Quickly Reacquirable Locks (AKA "Biased Locking")
+~~~~~~~~~~~~~
+
+    Java provides a monitors [9] for application-level synchronization.  
+    The particular implementation of monitors provided by the JVM author
+    is critical to the performance of multi-threaded Java applications.
+    One way to improve the performance of Java monitors is to implement them
+    with Quickly Reacquirable Locks (QRL).  QRL is described in detail in [4].
+    We now show how to implement QRL with an augmented Dekker mechanism.  
+    We apply the Dekker mechanism to synchronize the execution of a so-called
+    bias-holding-thread with the execution of a thread attempting to
+    revoke the bias of a quickly reacquirable object.
+
+    [4] describes how to accomplish revocation with safepoints, signals 
+    or thread suspension.  We provide a brief recap of QRL and then show
+    how to efficiently implement QRL with SERIALIZE() and page-based protections.  
+
+    Each Java object has a "lock word" which indicates if the object is 
+    locked or unlocked.  At any given time an object can be locked by
+    at most one thread.  
+
+    Traditionally, locking a Java object requires one CAS instructions for 
+    the uncontended case [14].  Depending on the implementation, an uncontended
+    unlock operation may require a CAS, a MEMBAR, or neither.  On many modern
+    architectures CAS (or lock:cmpxchgl on IA32) incurs considerable _local
+    latency on the processor executing the instruction.  Quickly reacquirable 
+    Locks (QRL) accelerates uncontended synchronization operations by eliminating
+    the CAS instruction.  The first time an object is locked we "bias" the 
+    object toward the locking thread.  (Alternately, we can bias the object 
+    toward a thread the very first time the object is unlocked).  Once the 
+    object is biased toward a thread, that thread can preferentially lock and
+    unlocked the object with simple LD-UPDATE-ST operations on the lock word, 
+    avoiding the CAS.  An object can be biased to at most one thread at a time.  
+    The thread to which the object is biased -- also called the 
+    bias-holding-thread -- can lock and unlock the object very efficiently. 
+
+    If some other thread R tries to lock the object while the object is biased
+    toward T, R needs to revoke or rescind the bias from T.  Once the bias is 
+    revoked subsequent synchronization operations on the object revert to the 
+    traditional monitor synchronization mechanism which employs CAS.  It is 
+    relatively rare for more than one thread to lock an object during the object's
+    lifespan, so revocation, while expensive, will be relatively rare.  Simple
+    uncontended locking -- which QRL accelerates by removing the CAS -- is extremely 
+    frequent in comparison.
+
+    To safely revoke bias we need to make sure that the revokee and revoker
+    threads don't interfere with each other.  The revokee (AKA bias-holding-thread)
+    can lock and unlock a biased object by mutating the object's lock word with 
+    a simple LD-UPDATE-ST sequence.  To avoid interference during revocation, i
+    the revoking thread arranges that (a) the revokee is not currently in the midst of 
+    updating the object's lock word, and, (b) that during revocation the revokee 
+    can not enter the "critical section" that updates the object's lock word.
+
+    Note that QRL locking is *asymmetric*.  Biased lock and unlock operations
+    are typically quite frequent while revocation will be infrequent.  
+
+    In the QRL filing [4] one of the embodiments used explicit memory barrier
+    instructions to synchronize the revoker and the revokee.  Briefly, the
+    MEMBAR-based QRL lock operates as follows:
+
+    MEMBAR-based QRL operators
+    --------------------------
+
+    -   Each thread has a unique "Self" pointer which refers to a thread-specific
+        data structure.  The Thread structure contains RevokeInProgress and InCrit
+        fields which are initially NULL.  
+
+    -   Each object has a LockWord field, referenced by obj->LockWord.
+
+    -   BIASUNLOCKED, BIASLOCKED, ISBIASEDBYOTHERTHREAD, ISBIASED, 
+        BIASEDTOWARD, ISFIRSTLOCK are helper routines that operate on 
+        object lockword values.
+    
+    -   The revoker thread and the bias-holding-thread use Dekker synchronization
+        to coordinate access to the object's LockWord field.  Note that Dekker
+        synchronization permits only two threads to synchronize.  For QRL 
+        there can only one revoker at any given time (because of the RevokeMutex, below) 
+        and there can be at most one bias-holding-thread, so we're reduced the 
+        problem from N threads to just 2 threads, which is tractable with Dekker.
+
+    -   The Unlock() method is not shown, but it utilizes the same Dekker critical
+        section construct as the Lock() code.
+
+    -   For the purpose of brevity the code below uses spinning, but in 
+        practice a real implementation would avoid spinning and instead use
+        POSIX pthreads condvars.  Also, the code may be vulnerable to livelock.
+        The back-off mechanisms and other methods used to avoid livelock
+        are not shown.
+
+
+      Lock (Object)
+        Retry:
+          // Enter critical section ...
+          Self->InCrit = Object                     // ST    
+          MEMBAR()                                  // MEMBAR
+          if Self->RevokeInProgress == Object       // LD
+                Self->InCrit = NULL
+                Delay
+                goto Retry
+          // critical section ... protects accesses to object->LockWord
+          // The critical sections performs a CAS-like operation on the
+          // lockword, except that the operation isn't atomic.
+          // Instead of CAS, we use {LD;test;br;modify;ST}
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              Self->InCrit = NULL     // Exit the critical section
+              return success
+
+          Self->InCrit = NULL
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return ;
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object         // ST
+              MEMBAR()                                      // MEMBAR
+              while (BiasHolder->InCrit == Object) SPIN() ; // LD
+              Object->LockWord = UNBIAS (Object->LockWord)
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+
+    
+    Note that by using the scheme above we've managed to eliminate 
+    the atomic CAS instructions present in most Java synchronization
+    schemes, but we've introduced MEMBARS, so the benefit depends
+    on the relative performance difference between MEMBAR and CAS.  
+    We now transform the MEMBAR-based form, eliminating the MEMBARs
+    from the Lock() path and using SERIALIZE() in the revocation path.
+
+    SERIALIZE-based QRL operators
+    -----------------------------
+
+    -   The bias-holding-thread is the "fast thread" and the revoking
+        thread is the "slow thread".  
+
+    -   In the common case the Lock() and Unlock() operations now
+        operate without any CAS or MEMBAR instructions, greatly
+        improving performance.  Most objects are locked by at most
+        thread during their lifetime, so revocation is rate and QRL
+        is usually profitable.
+
+    -   The Revoke() operation, while rarely executed, can be rather expensive.  
+        Some pathological applications could be written such that revocation 
+        is common and the revocation costs exceed the benefit derived from QRL.   
+        To avoid this situation we would maintain global and per-thread revocation
+        rate statistics.  (Not shown).  If the recent global or per-thread revocation 
+        rate exceeded some threshold, our implementation would suppress QRL by 
+        preventing a thread from biasing objects toward itself.
+
+        In addition, our implementation could profile which allocation sites 
+        (locations in application code that allocate new objects) and which
+        object types were vulnerable to pathological revocation.  That information
+        could, in turn, be used to inhibit the biasing of objects that are allocated
+        at a certain site or that are of a certain type.  
+
+    -   In one embodiment of QRL we implement SERIALIZE(t) by means of
+        stop-the-world or stop-the-thread safepoints.  The revoker
+        thread would force the bias-holding-thread to a safepoint.   Once safe,
+        the bias-holding-thread would execute a MEMBAR and then depart the
+        safepoint.  SERIALIZE() would not return to the caller (the revoking thread)
+        until after the bias-holding-thread the MEMBAR.  If the target thread
+        happened to be "outside" the JVM on a JNI call, it would be considered
+        already serialized, and SERIALIZE(t) would return immediately.
+
+      Lock (Object)
+        Retry:
+          // Enter critical section ...
+          Self->InCrit = Object                     // ST
+          if Self->RevokeInProgress == Object       // LD
+                Self->InCrit = NULL
+                Delay
+                goto top
+          // critical section ... protects accesses to object->LockWord
+          // The critical sections performs a CAS-like operation on the
+          // lockword, except that the operation isn't atomic.
+          // Instead of CAS, we use {LD;test;br;modify;ST}
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              Self->InCrit = NULL     // Exit the critical section
+              return success
+          Self->InCrit = NULL
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return ;
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // will still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object         // ST
+              SERIALIZE(BiasHolder)                         // SERIALIZE
+              while (BiasHolder->InCrit == Object) SPIN() ; // LD
+              Object->LockWord = UNBIAS (Object->LockWord)
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+
+
+    
+"JNI" execution barriers in a Java Virtual Machine
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
+
+    A Java application consists of one or more "mutator" or application threads.
+    Such threads access objects in the java heap.  When garbage collection (GC) of 
+    the heap must be performed, the collector typically stops all the mutator
+    threads.  (This called a stop-the-world collection, or STW).  The threads must be 
+    stopped otherwise both the mutators and the collector could attempt to 
+    concurrently access objects in the heap, resulting in unfortunate and 
+    undesirable interference.  To avoid interference the collector stops all 
+    the mutator threads before collecting the heap.  (Note that synchronization between 
+    mutators must be performed explicitly with volatile fields and java monitors, while 
+    synchronization between mutators and the collector is handled automatically
+    by the JVM, transparent to the mutators).  Once the mutators are stopped they
+    remain stopped for the duration of the collection.  When the collection is
+    complete the collector permits the stopped mutators to resume execution.   
+
+    Mutator threads can also call out of java code and into native C code by way of
+    the Java Native Interface, or JNI.  When a thread calls out it becomes a 
+    non-mutator.  To increase potential parallelism between the collector and 
+    threads that have called out, the collector does not stop such threads.  The JVM 
+    does, however, erect a logical execution barrier that prevents such threads from 
+    reentering the JVM (and becoming a mutator) while a collection is in progress.  
+    The JNI reentry barrier prevents "inscape" - the barrier prevents threads that 
+    are "outside" the JVM on JNI calls from reentering java code while a collection
+    is in-progress.  As a thread returns back from a JNI call into java code, the 
+    thread passes through the JNI reentry barrier.  If collection is in-progress 
+    the barrier halts the thread until the collection completes.  The prevents the 
+    thread from mutating the heap concurrently with the collector.  The JNI reentry 
+    barrier is commonly implemented with a CAS or a Dekker-like "ST;MEMBAR;LD" sequence
+    to mark the thread as a mutator (the ST) and check for a collection in-progress (the LD).  
+
+    Some apps, such as graphics intensive applications, call out repeatedly 
+    to short duration native methods.  In this case the MEMBAR in the JNI reentry
+    path significantly impacts performance.  
+
+    The JNI reentry path is a special case of synchronization where the mutator
+    and collector must coordinate their activities.   We will show below how
+    an augmented Dekker mechanism can be used to accelerate the JNI reentry path,
+    allowing removal of the MEMBAR.  Mutator-collector synchronization for JNI reentry
+    mechanism is asymmetric in that calls outs via JNI occur frequently but 
+    collections are relatively infrequent.   We speed up the JNI reentry path by
+    removing the MEMBAR but at the cost of adding code and expense to the path 
+    used to initiate a collection.  
+
+    Modern "on the fly" collectors, [12], [13], stop threads individually instead
+    of all threads simultaneously.   The JNI reentry barrier should provide support
+    for both stop-the-world (STW) and stop-the-thread (STT) collectors.  The ability to
+    stop individual threads at the JNI reentry barrier is also useful for java-level
+    thread suspension and java debuggers. 
+
+    The collector stops threads that are executing in java code with a mechanism
+    distinct from the JNI reentry barriers.   Threads in java code must periodically
+    poll or check a garbage-collection-pending flag.  If the flag is set the thread
+    stops itself and notifies the collector.  The collection can proceed only after
+    all threads executing in java have stopped themselves.  To assist the collector
+    the JNI reentry barrier must also track the state of mutator threads so the 
+    collector can determine if a particular thread is out on a JNI call or executing
+    within java code.  If the thread is executing in java code the collector will 
+    rendezvous with the thread in a cooperative fashion (setting a flag "asking" for
+    the thread to stop and then waiting for the thread to acknowledge the request).
+    The JIT ensures that all indefinite loops will eventually poll the flag and
+    check for pending safepoints, thus allowing for cooperative rendezvous.
+    If the thread is executing outside java code (out on a JNI call) the collector 
+    erects the JNI barrier to ensure the thread can not resume executing java code 
+    while the collection is in-progress.
+
+    MEMBAR-based JNI barriers
+    -------------------------
+
+    -   The HotSpot 1.4X and 1.5.0 JVMs use MEMBAR-based JNI barriers.
+
+    -   JNI transitions are much more frequently than garbage collections.
+
+    -   Each thread has an "InJava" indicating if the thread is currently 
+        executing out of the JVM on a JNI call into native code, or within
+        the JVM, as a normal mutator.   The threads writes to this flag and the 
+        collector reads the flag.  Similarly, each thread has private "Halt" flag.
+        The collector writes the Halt flag and the thread reads the Halt flag.
+        We will, of course, apply an augmented Dekker mechanism to allow the
+        collector and a mutator to synchronize with those two variables.
+
+
+       JNIReentry ()
+            ST 1, Self->InJava
+            MEMBAR
+            LD Self->Halt, t
+            bnz t, StopSelf
+            ...
+
+        GarbageCollector ()
+            for each mutator thread t
+                t->Halt = 1 
+            MEMBAR
+            for each mutator thread t
+                if t->InJava 
+                    CooperateWaitForRendezvous (t)
+            CollectJavaHeap()
+            for each mutator thread t
+                t->Halt = 0 
+                if t->InJava 
+                    ResumeFromSafepoint (t)
+
+
+    We can transform the MEMBAR-based form by replacing MEMBARs with SERIALIZE() :
+
+    SERIALIZE-based JNI barriers
+    ----------------------------
+
+       JNIReentry ()
+            ST 1, Self->InJava
+            LD Self->Halt, t
+            bnz t, StopSelf
+            ...
+
+        GarbageCollector ()
+            for each mutator thread t
+                t->Halt = 1 
+            MEMBAR
+            for each mutator thread t
+                SERIALIZE(t)                // [TAG1]
+                if t->InJava 
+                    CooperateWaitForRendezvous (t)
+            CollectJavaHeap()
+            for each mutator thread t
+                t->Halt = 0 
+                if t->InJava 
+                    ResumeFromSafepoint (t)
+
+
+
+SERIALIZE(t)
+~~~~~~~~~~~~
+
+First, we should more precisely state the requirements for SERIALIZE(t). 
+Lets say the "Fast thread" F executes {ST A ; LD B} and the 
+"Slow thread" S executes {ST B; MEMBAR; SERIALIZE(F); LD A;}.  
+Typically, F would act as the BHT or JNI mutator, while
+S would act in the role of the bias revoker or garbage collector.  
+
+When Serialize(F) returns, one of the following invariants must hold:
+
+  (A) If F has completed the {ST A} operation, then the value STed by 
+      F into A will be visible to S by the time SERIALIZE(t) returns.
+      That is, the {LD A} executed by S will observe the value STed 
+      into A by F. 
+
+  (B) If F has yet to complete the {ST A} operation, then 
+      when F executes {LD B}, F will observe the value STed
+      into B by S.  
+
+SERIALIZE(t) can be implemented in a number of ways:    
+     
+  (1) Intervention and disruption to force serialization.
+  
+      SERIALIZE(t) can disrupt t's execution, forcing t to serialize.
+      Possible implementations:
+  
+      A.  Cross-calls (x-calls or Inter-Processor Interrupts)
+
+          Note that x-calls are implemented as traps, and traps
+          are serializing on all modern processors. 
+  
+      B.  Signals and ACBs
+
+          The slow thread can post a UNIX signal or Windows ACB to the 
+          fast thread and then wait for the fast thread to respond.
+          The signal handler or ACB executes a MEMBAR and then sends
+          an acknowledgement or reply to the slow thread, indicating that
+          the MEMBAR was complete.  After sending the signal the slow
+          thread -- the thread that called SERIALIZE --  waits for acknowledgement
+          from the fast thread.  Upon receipt of the reply the slow thread
+          knows that a MEMBAR has recently been completed by the fast thread.
+          In this way the revoker can force the revokee to execute a MEMBAR.
+          The slow thread literally forces the fast thread to transiently 
+          stop executing its normal instructon stream and instead execute a MEMBAR.
+  
+          Note that signals pose difficulties on Solaris and Linux.
+          Not all native code is signal-safe, so if we post a signal
+          to a thread as the thread is transitioning out of the JVM 
+          (which is completely signal-safe) to foreign code that isn't
+          signal-safe, then we risk delivering a signal into signal-unsafe code.
+          One solution would be to erect a signal-pending barrier in the JNI
+          exit path, but such a barrier would require a CAS or MEMBAR. 
+  
+      C.  Instead of sending signals to the fast thread, we send signals to
+          dedicate martyr threads, avoiding the signal-safety issues noted above.
+          Each processor in the system would have a dedicated "martyr"
+          thread.  The martyr thread is bound to the processor via
+          sched_setaffinity, processor_bind, or thread_setaffinity.  
+          Once bound, the thread is permitted to run on only that processor.
+          The martyr threads, being our own construct, are completely signal safe.   
+
+          If an interface such as Solaris's schedctl is available, whereby the
+          slow thread could determine the CPU on which the fast thread is currently
+          running, then the SERIALIZE(t) operation would post a signal to the
+          martyr thread associated with that CPU.  The slow thread would then
+          wait for a reply from the martyr thread.  The martyr thread's signal
+          handler would execute a MEMBAR and then reply to the slow thread.  
+          Upon receiving the reply the SERIALIZE() routine would return to the caller.
+
+          If a schedctl-like capability is not available, SERIALIZE(t) must
+          iteratively post signals to *all* martyr threads, and then, after
+          having send the signals, wait for all the martyr to respond.  (In this
+          way the signal handlers can operate in parallel).  
+
+          Note that bound martyr have undesirable interactions with
+          psradm and Solaris's "DR" (dynamic reconfiguration) facility.
+  
+      D.  thr_suspend, and /proc PSTOP
+
+          Suspending or stopped a thread is serializing event for
+          some operating systems.  Alternately, SERIALIZE(t) could
+          stop or suspend thread target thread and then examine the
+          thread's instruction pointer (IP or PC).  If the IP was
+          within a critical {ST;LD} sequence the SERIALIZE(t) operator
+          could (a) resume the thread, delay briefly, and retry, until 
+          it found that "t" was not stopped inside a ST-LD sequence, (b) 
+          directly interpret the instructions in the ST-LD sequence, 
+          performing the operations of behalf of "t", and advancing t's IP 
+          as appropriate.  
+        
+  (2) Context switching 
+
+      A.  Pure Context switching
+
+          Each CPU has a dedicated martyr thread bound to it.  
+          SERIALIZE(t) determines the processor on which t is running,
+          if any, and sends a message to the martyr associated with 
+          that processor.  SERIALIZE(t) then blocks, waiting for a 
+          response or acknowledgement from the martyr.  When the 
+          martyr receives a message it immediately responds to the thread 
+          that called SERIALIZE(t).  Upon receiving the reply from the martyr, 
+          SERIALIZE() returns to the caller.
+
+          When control returns from SERIALIZE(t), the thread calling
+          SERIALIZE(t) is guaranteed that thread "t" transitioned
+          off the processor at least once in order to allow the martyr
+          to run.  As such, we know that "t" was descheduled or, in
+          Solaris terminology, transitioned from ONPROC to OFFPROC [10]. 
+          The martyr _displaced "t" on the processor.  Transitioning OFFPROC 
+          is a serializing event.   
+
+          Pure context switching could implemented with condvar-mutex pairs,
+          sockets, SystemV messages, semaphores, pipes, etc.  
+
+          As applied to QRL, the revoker can send messages to all the martyr 
+          threads -- or, as a a refinement to just the specific processor on 
+          which the revokee was last dispatched.  The revoker then waits for 
+          acknowledgement of all the messages it sent.  Upon receipt of all 
+          acknowledgements the revokee can know with certainty that context 
+          switching has occurred on the processor where the revokee last ran.  
+          Since context switching implies that the store buffers were flushed, 
+          the revoker then knows that any STs by the revokee to its InCrit field 
+          are visible.  
+
+          To improve parallelism the revoker could implement a send phase, 
+          sending asynchronous messages to each martyr, and then enter a wait 
+          phase, waiting for all martyr to respond.  This permits multiple
+          outstanding or in-flight messages to exist between the revoker
+          and the martyrs, maximizing parallelism.  The alternative, where
+          the revoker would send a message to each martyr and wait for
+          a reply in a serial fashion would also work, but lacks parallelism.
+
+      B.  Displacement binding - Intentional displacement
+
+          push displacement
+          -----------------
+
+          Displacement binding is a variant of context switching.
+          The slow thread binds directly to the processor on
+          which the fast thread is currently running.  In this way
+          the slow thread displaces the fast thread, and the fast
+          thread is known to have gone OFFPROC and serialized.
+          In the so-called go-there, or "push" model, the slow thread 
+          "visits" the processor associated with the fast thread,
+          pushing it off the processor.
+
+          If we can not determine the identity of the processor on which
+          the fast thread is running (schedctl is not available) or
+          we need to serialize the execution of *all* threads for STW JNI,
+          then we need to visit, or transiently bind to, all processors.
+          If the number of processors is large, then iteratively binding
+          to each in turn, which is inherently serial, can be slow.  To accelerate
+          visiting we can employ multiple visitor thread to assist the
+          slow thread.  The visitor threads operate in parallel.  
+
+          pull displacement
+          -----------------
+
+          Alternately, the slow thread can bind the fast thread to the
+          processor on which the slow thread is currently running.
+          When the bind operation, which is synchronous, returns,
+          the slow thread is guaranteed that the fast thread went OFFPROC.
+          This is so-called come-here or "pull" model where the 
+          fast thread visits the processor associated with the slow thread.
+          Pull displacement is less efficient for STW operations, requiring
+          O(Threads) binding operations as compared to O(Processors) binding
+          operations for push displacement.
+
+  (3) Passive  
+
+      In passive serialization, SERIALIZE(t) passively waits or delays
+      for a sufficient interval, ensuring that any pending remote stores 
+      executed by threads on other processors will become visible to
+      the thread calling SERIALIZE(t).  
+
+      As a variation, we could arrange for each processor to periodically 
+      serialize itself by executing a MEMBAR and then incrementing a per-CPU 
+      "Tick" epoch variable.  The slow thread could simply spin, waiting for
+      the Tick variable to change.  After observing the value change
+      the slow thread would be guaranteed that the processor had
+      serialized its execution.  This is vaguely similar to RCU or
+      epoch-based reclamation (EBR) schemes.  
+  
+
+
+Optimizing SERIALIZE() with Solaris' schedctl
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Solaris provides a very efficient mechanism -- called schedctl -- by which
+user-mode threads can determine the scheduling state (ONPROC vs OFFPROC)
+of another thread, as well as the identify of the CPU on which a thread
+runs or last ran.  Each thread has a private "sc_cpu" field.  Any thread 
+can read the sc_cpu field of another thread with a simple load instruction.  
+As the kernel dispatches a thread onto a processor it sets the thread's sc_cpu
+field to the ID of processor. 
+
+We can optimize SERIALIZE(t) with schedctl as follows:
+
+A.  if t is OFFPROC then SERIALIZE(t) needs take no further actions.
+    OFFPROC implies that the user-mode execution of the thread is 
+    has been serialized.  
+
+B.  If t is ONPROC, then we can use schedctl to determine the 
+    CPU on which t is running.  By identifying a particular CPU
+    we can restrict the cross-calls, signals, etc., used by
+    SERIALIZE to just that CPU, instead of serializing the execution
+    all CPUs as would be required absent sc_cpu.  
+
+As applied to QRL if the bias-holding-thread is OFFPROC then its execution has 
+been serialized and the revoker needs take no further action.  Only when a 
+thread is ONPROC does SERIALIZE(t) need to take *active* measures.   If the 
+bias-holding-thread is ONPROC the revoker can restrict x-calls, binding, or
+ context-switching to just the CPU on which the mutator most recently ran.
+
+If our mechanism users martyr threads and the revoking thread can determine the last
+processor on which the revokee was dispatched then revoker can send a signal to 
+just the martyr thread associated with that processor.  Absent schedctl, the
+revoker would need to send signals to *all* martyr threads. 
+
+Note that the revokee might migrate to another processor between the time 
+the revoker sampled sc_cpu and the time the revoker sends the signal to the 
+martyr thread.  This is benign, as migration or context switching activities
+also flush a processor's store buffer.  In any case - if the revokee is still 
+running on the CPU, if the revokee has migrated to another CPU, or 
+if the revokee has been preempted, then we know that all latent STs 
+by the revokee are flushed and visible to the revoker.
+
+In more detail ...
+
+Note that the revoker might load the revokee's sc_cpu value and then
+the revokee might (a) be preempted by another thread, or (b) migrate
+to some other processor before the revoker can send a signal to the
+appropriate martyr thread.  That is, the sc_cpu value fetched by the
+revoker can become stale and out-of-date almost immediately.  This 
+condition is benign as both context switches (being descheduled from 
+a processor -- called "going OFFPROC" in solaris terminology)
+and migration cause a thread to serialize execution.  In any case - 
+if the revokee is still running on the same CPU, if the revokee has
+migrated to another CPU, or if the revokee has been preempted and is
+not running -- then at the time the martyr thread acknowledges the 
+signal we know that if the revoke was in the midst of the critical
+ST-LD sequence that either (a) the latent ST to InCrit, if any, will 
+be visible to the revoker, or the LD by the revokee will observe
+the value recently stored by the revoker.
+
+If a thread is not ONPROC then all its user-mode STs are visible
+and all speculative past the interrupted user-mode IP is cancelled.
+More precisely, there is a memory barrier between the transition
+out of user-mode and the ST into the sc_state field.  If T2
+observes that T1's sc_state field is not ONPROC then T2 is guaranteed 
+that all T1's prior user-mode STs are visible to T2.  
+
+
+Synchronization based on page-protections - mprotect()
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+We can also implement Dekker-like mutual exclusion with virtual page-permissions.  
+APIs such as mprotect() and VirtualProtect() allow user-mode applications to
+change the protections for virtual pages. 
+
+Consider the following trivial example where FastThread and SlowThread both
+use mutual exclusion to access a common critical section. 
+
+    [BASICMPROTECT]
+
+    FastThread:
+        ST InCrit = 1                       // mark as in guarded critical section.
+        <CriticalSection>
+        ST InCrit = 0 
+        
+    TrapHandler:
+        // Return and retry the offending store.
+        // This constitutes a spin.  
+        return ;      
+
+    SlowThread:
+        for (;;) {
+            while (InCrit == 1) Delay() ; 
+            mprotect PageOf(A) RO       // [SETRO]
+            if (InCrit == 0) break ;    // [LDINCRIT]
+            mprotect PageOf(A) RW
+            BackOffDelay () ; 
+        }
+        <CriticalSection>
+        mprotect PageOf(A) RW
+
+
+Critically, the mprotect RO (READONLY) operation, tagged [SETRO], imposes 
+a global ordering on all STs to InCrit.   If the mprotect() occurs before the
+fast thread STs into InCrit and the fast-thread then attempts to enter the critical
+section, the ST to InCrit will trap and the thread will be excluded from the critical section.
+If the fast thread STs to InCrit before the mprotect(), the mprotect() is serializing
+and forces the fast thread's prior ST into InCrit to be visible to the slow thread
+at [LDINCRIT].  That is, the mprotect() establishes a happens-before relationship
+between the ST, the mprotect() itself, and the visibility of the ST to the thread
+that executed the mprotect().  The ST either happens before the mprotect(), in
+which case it will be visible, or after the mprotect(), in which case it will trap.
+
+The mprotect() or VirtualProtect() operations must be synchronous. 
+This property ensures that modifications to the page permissions
+must be visible to all processors before the mprotect() call returns to
+the caller.  In addition if the mprotect() removes WRITE pmermissions from the
+page then all pending & committed ST operations to the mprotect()ed page
+must be made visible before the protections change and the mprotect() 
+returns.  (If this requirement were not true then a thread could 
+mprotect() a page to be read-only but later observe changes to the page 
+because of latent stores.  Similarly, if the "no-latent-store" property 
+didn't hold a dirty page being swapped to disk by the operating system 
+could "miss" tardy stores.  Prior to swapping a page the operating system
+removes write permissions from the page in a manner similar to
+mprotect().  All remote TLBs that reference the page must be invalidated
+or updated.  Once the TLBs are invalidated the operating system can
+schedule the write operation that transfers the page from memory to disk).
+Collectively we call this the "TLB coherence" property.  In summary, 
+before mprotect() or VirtualProtect() returns to the caller the new page
+permissions must be visible to all processors in the system, and if the
+mprotect() call rescinds write permissions, then any committed but not 
+yet visible remote STs to the page must be forced visible to at least 
+the processor calling mprotect().
+
+Modern processors usually have translation lookaside buffers, or TLBs,
+which are small hardware caches of virtual page protections and 
+virtual-to-physical address mappings.  TLBs accelerate virtual-to-physical 
+address translation and protection checks.  The system must ensure that
+all TLBs remain coherent with the current virtual permissions 
+associated with a page.  Specifically an mprotect() operation on
+a multiprocessor system must ensure that all TLBs, including those in
+other processors, that contain stale permissions are invalidated.  
+Typically, the kernel implements mprotect() by invalidating any TLBs on the
+the current CPU and by sending "cross-calls" to the other processors, 
+instructing them to invalidate their TLBs as well.  Cross-calls are
+also referred to as x-calls or inter-processor interrupts.  Cross-calls
+to perform TLB invalidation are sometimes called TLB shoot-downs.  
+See [10] and [11], Section 4.4.2, "Maintenance of TLB coherency" for details. 
+
+Page protection traps, if taken, are precise and serialize execution on
+the processor taking the trap.  Any pending STs are flushed to memory
+before the trap handler executes.
+
+The Dekker-duality is present in [BASICMPROTECT], but expressed 
+in a subtle form:
+
+   -  The fast thread first STs into InCrit.  The processor implements 
+      the ST into InCrit as an atomic operation with the following checks:
+
+         Load the permissions for pageof(InCrit)
+         if permissions are READONLY then trap into TrapHandler()
+         Store value into InCrit
+
+      Critically, the ST action is atomic with respect to any concurrent
+      mprotect() operations.   
+
+   -  The complementary code in the slow thread executes:
+
+         mprotect(InCrit) :: Store into permissions for pageof(InCrit)
+         MEMBAR
+         LD InCrit
+
+      Critically, the storage used for page permissions -- hardware translation 
+      lookaside buffer entries (TLBs) or software structures used to track and store
+      virtual page permissions -- are accessed in a sequentially consistent (SC) fashion
+      by the LDs, STs and operating system.   At any given time all processors must
+      have the same "view" of page permissions.  That is, accesses to page permission
+      storage is sequentially consistent for LDs, STs, and mprotect() operations.  
+      Recall that normal LDs and STs to a page will fetch from page permission storage
+      memory and mprotect() will store into page permission storage.  More precisely
+      a normal ST atomically LDs and tests the page permissions, and, contingent
+      upon the outcome of the permission check, commits the ST.   Those permission
+      tests are performed in program order so as to permit precise traps. 
+      (The TLB is simply a hardware cache of page permissions.  On an Intel IA32 processor, 
+      for instance, processor-local TLB loads and evictions are managed entirely by hardware.  
+      Inter-processor TLB coherency, however, is the responsibility of operating 
+      system software.  Operation system software typically uses cross-calls and
+      TLB shoot-downs to force stale TLB entries to be evicted from remote 
+      processors).  
+
+      The mprotect(READONLY) executed by the slow thread forces any potential pending 
+      STs by the fast thread into InCrit to become immediately visible to the slow thread.
+      More precisely, if the fast thread executed a ST into InCrit before the
+      mprotect(READONLY) operation, then that ST will be visible to the slow thread
+      by the time the mprotect() call returns.  If the fast thread executes a ST to InCrit
+      after the mprotect() takes effect the ST will trap and the revoker will enter 
+      the TrapHandler().  The mprotect() operation is a *linearization* point in that 
+      all STs involved in the synchronization protocol can be said to occur either 
+      before or after the mprotect request becomes effective.  The mprotect(READYONLY) 
+      imposes a global ordering on STs into InCrit.
+
+    
+Variations and detailed sketches
+~~~~~~~~~~
+
+*   [V0Generic] : generic construction of a CAS-like operator
+
+    -   We construct a CAS-like FastCompareAndSet () operator.  
+        The fast thread (and only the one distinguished fast thread) uses 
+        FastCompareAndSet() to update some shared variable variable.  
+
+    -   FastCompareAndSet() is efficient as it doesn't use expensive
+        atomic operaitons.  SlowCompareAndSet() is used by the slow 
+        thread to update the shared variable.
+
+    -   There can be at most one thread acting as the fast thread
+        at any given times.  If more than 2 threads access SharedV
+        then all the other (non-fast) threads act as slow threads
+        and must use SlowCompareAndSet().
+
+    -   It's possible to add any additional protocol on top of 
+        [V0Generic] to permit different threads to alternate in the role
+        of fast thread. 
+     
+
+      FastCompareAndSet (addr, cmp, set)
+          // Self is the fast-thread
+          // Guarded critical section ...
+          // Addr points to the shared variable.
+        ReRun:
+          Self->InCrit = addr
+          if Self->Revoking == addr
+             Self->InCrit = null
+             while (Self->Revoking != addr) Delay() ; 
+             // Either return failure or goto ReRun
+             goto ReRun
+          // read-modify-write on adr
+          if *addr == cmp       // LD-CMP-Bcc-ST
+             *addr = set ;      
+             Self->InCrit = null
+             return SUCCESS
+          Self->InCrit = null
+          return FAILURE
+
+      SlowCompareAndSet (addr, cmp, set)
+          // FastThread is the revokee. 
+          // The slow thread is the revoker
+          revokee = FastThread ; 
+          pthread_mutex_lock (revokee->mutex) 
+          revokee->Revoking = addr
+          MEMBAR #storeload
+          while (revokee->InCrit == addr) DELAY() 
+          // Serialize (revokee) ...
+          mprotect PageOf(revokee->InCrit) RO
+          mprotect PageOf(revokee->InCrit) RW
+          while (revokee->InCrit == addr) Delay() ; 
+          MEMBAR #loadload
+          ResultIndication = FAILURE
+          if (*addr == cmp) {
+             *addr = set 
+             ResultIndication = SUCCESS
+          }
+          revokee->Revoking = null
+          pthread_mutex_unlock (FastThread->mutex) 
+          return ResultIndication
+            
+      TrapHandler()
+          // On Unix or Linux the TrapHandler() would be implemented with signals.
+          // On Windows the TrapHandler() would be implemented with either
+          // structured exception handling (SEH) or vectored exception handling (VEH).
+          // We return immediately, simply retrying the offending ST.  
+          MEMBAR()
+          return ;
+
+
+*   [V1] QRL operators constructed with per-thread poll safepoints.  
+
+    -   The revoker thread forces the bias-holding-thread to a safepoint.   
+        Safepoints are not permitted within the Dekker critical sections
+        that protect object->LockWord access, so once a the bias-holding-thread
+        reaches a safepoint, the revoking thread can be certain that the BHT 
+        was not in the midst of a critical section, and that the BHT could 
+        not enter a critical section.  
+
+    -   ForceSafepoint() is synchronous - it doesn't return until the
+        the thread has reached a safepoint, or it has been verified
+        that the thread is "outside" the managed runtime environment (JNI)
+        and can not reenter.
+
+    -   We could implement ForceSafePoint() with stop-the-world safepoints,
+        but that's likely to be inefficient.  Stop-the-thread safepoints
+        (per-thread safepoints) are likely much more efficient.  
+
+    -   HotSpot doesn't currently support stop-the-thread (STT) per-thread 
+        safepoints.
+
+      Lock (Object)
+        Retry:
+          // critical section ... protects accesses to object->LockWord
+          // Invariant: no safepoints inside the critical section.
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              // Exit the critical section
+              return success
+          // Exit the critical section
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return ;
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              ForceSafePoint (BiasHolder) ;         
+              Object->LockWord = UNBIAS (Object->LockWord) ; 
+              ResumeSafepoint (BiasHolder) ; 
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+
+*   [V2] : QRL based on page-permissions and TLB coherency
+
+    -   We now present yet another embodiment of QRL that uses page-based
+        protection and TLB coherence to eliminate explicit MEMBAR instructions.
+
+    -   Each thread also has a unique virtual page, referred to as Self->VPage. 
+        VPage would normally be allocated by mmap() on Unix or Linux systems or
+        VirtualAlloc() on Windows.  The protections of VPage can be adjusted by
+        mprotect() on Unix or Linux and VirtualProtect() on Windows.
+
+    -   Each VPage contains an InCrit variable and nothing else.
+        InCrit is initially NULL (0). 
+
+    -   Stores to Self->VPage->InCrit can trap in which case
+        control diverts to the TrapHandler() routine.
+
+    -   We replace CAS &LockWord with
+            ST Incrit = Object
+            [ Critical Section - Mutate LockWord.  Use LD;Test;Br;Modify;ST]
+            ST InCrit = NULL  
+
+
+      Lock (Object)
+          // Enter QRL critical section
+          // The ST to InCrit can trap into TrapHandler
+          Self->VPage->InCrit = Object       
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              // Exit the QRL critical section
+              // The ST to InCrit can trap into TrapHandler
+              Self->VPage->InCrit = NULL     
+              return success
+          Self->VPage->InCrit = NULL
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Unlock (Object)
+          Self->VPage->InCrit = Object        // Enter QRL critical section
+          tmp = Object->LockWord
+          if tmp == BIASEDLOCKED(Self)
+              Object->LockWord = BIASEDUNLOCKED(Self)
+              Self->VPage->InCrit = NULL      // Exit QRL critical section
+              return success
+          Self->VPage->InCrit = NULL
+          ... continue into traditional Unlock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return ; 
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // [TAG:QRLMPROTECT:V2]
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object
+              mprotect BiasHolder->VPage READONLY
+              MEMBAR()
+              while (BiasHolder->VPage->InCrit == Object) SPIN(); 
+              Object->LockWord = UNBIAS (Object->LockWord)
+              mprotect BiasHolder->VPage READWRITE
+              BiasHolder->RevokeInProgress = NULL
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+      
+      TrapHandler()
+          // On Unix or Linux the TrapHandler() would be implemented with signals.
+          // On Windows the TrapHandler() would be implemented with either
+          // structured exception handling (SEH) or vectored exception handling (VEH).
+          MEMBAR()
+          if Self->VPage->InCrit != NULL
+              // In this case "Self" must be exiting a critical region and
+              // the ST of NULL into Self->VPage->InCrit trapped.
+              // Note that when we return from the trap handler we will
+              // restart the offending ST.  The redundant ST is benign.  
+              // Storing and re-storing a NULL into Self->VPage->InCrit 
+              // is an idempotent operation. (It's OK if we do it twice). 
+              mprotect Self->VPage READWRITE
+              Self->VPage->InCrit = NULL
+              while (Self->RevokeInProgess != NULL) SPIN(); 
+          return  // retry trapping ST
+
+    Remarks:
+    -------
+
+    -   To avoid an excessive trap rate caused by STs into Self->VPage->InCrit
+        it may be profitable to add an optimization where threads executing
+        Lock() and Unlock() first LD from Self->RevokeInProgress.  If 
+        RevokeInProgress is non-zero the thread should block itself or spin.  
+        This avoids the cost of the taken trap.  
+
+    -   In Revoke(), above, after mprotect()ing the InCrit page READONLY, if the
+        revoking thread observes that the revokee's InCrit field is equal to the 
+        object in question, then the revoker could simply restore the page 
+        protections to READWRITE and retry the operation later.  
+
+    -   The thread-specific RevokeMutex restricts the number of concurrent
+        revokers to at most one.  Likewise, an object can be biased to at
+        most one thread at time, so we have reduced the problem from N
+        threads to just two threads - the bias-holding-thread and a single
+        revoker.  This permits us to employ a 2-thread / 2-variable Dekker
+        mechanism to coordinate the actions of the revoker and the revokee.
+        The two variables used by the protocol are the InCrit flag and,
+        implicitly, the page-permissions associated with the InCrit page.
+    
+
+*   [V3] : QRL based on page-based permissions - back-to-back mprotect
+
+    -   This variation employs back-to-back mprotect READONLY-READWRITE
+    
+      Lock (Object)
+          // Enter QRL critical section
+          // The ST to InCrit can trap into TrapHandler
+          // Note that we ST into InCrit and then LD from RevokeInProgress
+          // with no intervening MEMBAR.
+        Retry:
+          Self->VPage->InCrit = Object       
+          if Self->RevokeInProgress == Object
+              Self->VPage->InCrit = NULL
+              goto Retry
+          
+          // critical section ... 
+          // Inspect the lock-word.  If it is BIASUNLOCKED(Self) 
+          // then change it to BIASLOCKED(Self).
+          // Note that the operation is CAS-like.  
+
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              // Exit the QRL critical section
+              // The ST to InCrit can trap into TrapHandler
+              Self->VPage->InCrit = NULL     
+              return success
+          Self->VPage->InCrit = NULL
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return 
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // [TAG:QRLMPROTECT:V3-BTB]
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object
+              MEMBAR()
+              // Serialize (BiasHolder) ...
+              mprotect BiasHolder->VPage READONLY
+              mprotect BiasHolder->VPage READWRITE
+              while (BiasHolder->VPage->InCrit == Object) SPIN(); 
+              Object->LockWord = UNBIAS (Object->LockWord)
+              BiasHolder->RevokeInProgress = NULL
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+      
+      TrapHandler()
+          // On Unix or Linux the TrapHandler() would be implemented with signals.
+          // On Windows the TrapHandler() would be implemented with either
+          // structured exception handling (SEH) or vectored exception handling (VEH).
+          // We return immediately, simply retrying the offending ST.  
+          MEMBAR()
+          return ;
+
+    Remarks
+    -------
+
+    -   In this variant of Revoke() the two mprotect() calls are 
+        back-to-back.  The mprotect(READONLY) operation serializes the
+        execution of the revokee --  a concurrent ST into InCrit by the revokee
+        will either be made visible to the revoker, or the ST will trap into
+        the TrapHandler.  Recall that memory-protection traps are precise.
+
+        A.  If the ST into InCrit occurs before the mprotect(READONLY) takes effect
+            then the mprotect(READONLY) will force the pending ST, if any, to
+            become visible to the revoking thread.
+
+        B.  If the ST into InCrit occurs after the mprotect(READONLY) takes effect
+            then the ST will trap into TrapHandler().  Since memory-protection traps 
+            are precise and the ST didn't complete, the LD of RevokeInProgress -- 
+            which follows the ST in program order -- could not have been reordered 
+            with respect to the prior ST.  After the revoker restores READWRITE 
+            protections to the page containing InCrit the revokee will restart the
+            ST-LD sequence, ST into InCrit and LD RevokeInProgress.  The LD of 
+            RevokeInProgress is guaranteed to observe the non-zero value previously 
+            STed by the revoker.  The revokee is thus denied entry into the critical 
+            section.  
+
+
+*   [V3B] : QRL based on page-based permissions - global page
+
+    -   A global RevPage is used instead of per-thread pages
+
+    -   A global IsRW flag tracks RevPage state - READONLY vs READRWRITE
+        The use of IsRW is an optimization to decrease the trap rate.
+
+    -   Any pending revocation operation forces *all* threads (threads other
+        than the BHT) through the slow path with the MEMBAR.  Obviously,
+        a count of the number of revocations currently in-progress must
+        be maintained, and the "RevPage" must not become READWRITE
+        unless that count is zero.  
+
+    
+      Lock (Object)
+          // Enter QRL critical section
+          // Entry into the critical section is via a Dekker protocol
+          // where the entering thread executes ST InCrit ; LD RevokeInProgress
+          // The critical section protects access to the Object's LockWord
+        Retry:
+          Self->InCrit = Object         // ST           
+          if (IsRW) {                   // LD
+              // fast-path
+              *RevPage = 0 ;            // potentially trapping ST
+          } else {
+              // slow-mode - use MEMBAR
+              MEMBAR() 
+              if (Self->RevokeInProgress == Object) { 
+                 Self->InCrit = NULL ; 
+                 Delay () ; 
+                 goto Retry ; 
+              }
+          }
+ 
+          // critical section ... 
+          // Inspect the lock-word.  If it is BIASUNLOCKED(Self) 
+          // then change it to BIASLOCKED(Self).
+          // Note that the operation is CAS-like.  
+
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              // Exit the QRL critical section
+              Self->InCrit = NULL       // Exit Critical
+              return success
+          Self->InCrit = NULL           // Exit Critical
+
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return 
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // [TAG:QRLMPROTECT:V3B]
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object
+              pthread_mutex_lock (ProtLock); 
+              if ((Revoking++) == 0) { 
+                IsRW = 0 ; 
+                mprotect RevPage READONLY
+              }
+              ASSERT (IsRW != 0 && Revoking > 0) ; 
+              pthread_mutex_unlock (ProtLock) ; 
+              MEMBAR()
+              while (BiasHolder->VPage->InCrit == Object) SPIN(); 
+              Object->LockWord = UNBIAS (Object->LockWord) ; 
+              pthread_mutex_lock (ProtLock) 
+              if ((--Revoking) == 0) { 
+                 mprotect RevPage READWRITE
+                 IsRW = 1 ; 
+              }
+              pthread_mutex_unlock (ProtLock)
+              BiasHolder->RevokeInProgress = NULL
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+      
+      TrapHandler()
+          // On Unix or Linux the TrapHandler() would be implemented with signals.
+          // On Windows the TrapHandler() would be implemented with either
+          // structured exception handling (SEH) or vectored exception handling (VEH).
+
+          if (FaultingAddress == RevPage) { 
+              registers->UserIP = Retry ;       // Deflect control
+          }
+          return ;
+
+*   [V3C] : QRL based on page-permissions
+
+    -   Extremely similar to [V2]
+
+    -   Uses per-thread dedicated pages.  
+        The thread-specific pages must be immortal (TSM)
+
+
+    Lock (obj)
+        // Lockword mutator -- guarded critical section
+        Self->InCrit = obj
+        tmp = obj->LockWord
+        if (tmp == BIASUNLOCKED(Self)) {
+            obj->LockWord = BIASLOCKED(Self) ; 
+            Self->InCrit = NULL ; 
+            return ; 
+        ...
+        
+    Trap()
+        if FaultingAddress == &Self->InCrit
+            if (Self->InCrit != null) { 
+                mprotect PageOf(Self) RW
+                Self->InCrit = null 
+            while (Self->RevObj != null) SPIN() ; 
+            return
+
+    Revoke(obj)
+        for 
+            v = obj->LockWord
+            if !BIASED(v) return
+            t = BIASHOLDINGTHREAD(v)
+            // Exclude other revokers so the only possible concurrency
+            // is this thread vs the BHT
+            lock t->RevLock
+            v = obj->LockWord
+            // The following test is an optional optimization ...
+            if !BIASED(vfy) || BIASHOLDINGTHREAD(vfy) != t
+                unlock t->RevLock
+                continue ; 
+            t->RevObj = obj
+            MEMBAR
+            mprotect PageOf(t) RO
+            v = obj->LockWord
+            if !BIASED(v) || BIASHOLDINGTHREAD(v) != t
+                mprotect PageOf(t) RW
+                t->RevObj = null 
+                unlock t->RevLock
+                continue ; 
+            // If the BHT is within the critical section, 
+            // wait for it to vacate.
+            if Self->InCrit == obj
+                while (Self->InCrit != 0) 
+            v = obj->LockWord
+            if !BIASED(v) || BIASHOLDINGTHREAD(v) != t
+                mprotect PageOf(t) RW
+                t->RevObj = null 
+                unlock t->RevLock
+                continue ; 
+            // The BHT is outside the critical section and can't reenter
+            // There are no other sources of concurrency (lockword mutators)
+            // This thread (the revoker) has exclusive access to the object's
+            // lockword
+            obj->LockWord = UNBIAS(v)
+            mprotect PageOf(t) RW
+            t->RevObj = null
+            unlock t->RevLock
+            return
+                
+*   [V3D]
+
+    --  Requires a dedicated per-thread page.
+        The thread-specific pages must be immortal and TSM.
+
+    --  Requires a dedicated and distinguished "REVOKING(t)" lockword value.
+        REVOKING(t) is a reserved encoding. 
+
+    --  Invariant: t != s IFF REVOKING(t) != REVOKING(s)
+
+    --  Instead of requiring unique per-thread REVOKING(t) encodings we might also
+        use a small pool of REVOKING encodings:  
+            id = RevokingAllocate ()
+            RevokingRelease (id)
+            ISREVOKING(id) == TRUE
+
+    --  [TAG:QRLMPROTECT:QD-BTB]  
+        [TAG:QRLMPROTECT:V3D]
+        Variation on QRLMPROTECT:QD
+        See also: QRLMPROTECT:SMP040109B
+
+    Lock (obj)
+        // Lockword mutator
+        Self->InCrit = obj
+        tmp = obj->LockWord
+        if (tmp == BIASUNLOCKED(Self)) {
+            obj->LockWord = BIASLOCKED(Self) ;      // [SQUASH] 
+            Self->InCrit = null ; 
+            return ; 
+        }
+        if (ISREVOKING(v)) { 
+            Self->InCrit = null ; 
+            // Either spin waiting for obj->LockWord != REVOKING
+            // or simply retry the Lock() operation.  Retrying
+            // is tantamount to spinning.
+            retry ; 
+        }
+        ...
+       
+    Trap()
+        return
+
+    Revoke(obj)
+        // Replace the classic Dekker (ST InCrit;VMEMBAR;LD RevObj) with a 
+        // distinguished REVOKING lockword encoding.  We eliminate RevObj 
+        // and replace it with a distinguished value in obj->MarkWord.  
+        // The new entry/Lock protocol becomes (ST InCrit;VMEMBAR;LD LockWord)
+ 
+        for 
+            v = obj->LockWord
+            if ISREVOKING(v) continue       // spin
+            t = BHT(v)
+            if t == null return 
+            if CAS (&obj->LockWord, v, REVOKING(Self)) != v continue ; 
+            MEMBAR
+            // Ensure that REVOKING is visible to the BHT.
+            if (opto) { 
+                // Equivalently: Serialize(t)
+                // See RFE 5079829
+                mprotect PageOf(t) RO
+                mprotect PageOf(t) RW
+            } else { 
+                // Grab the lock to protect native C page mutators
+                // from encountering spurious traps.  
+                pthreads_mutex_lock (t->RevMux) ; 
+                mprotect PageOf(t) RO
+                mprotect PageOf(t) RW
+                pthreads_mutex_unlock (t->RevMux) ; 
+            }
+            // Wait for the BHT to vacate the guarded critical section.
+            // The BHT won't reenter the critical section as REVOKING
+            // is now visible. 
+            while (t->InCrit == obj) ; 
+            MEMBAR #loadload
+            // Beware: a BHT-mutator could have stomped or overwritten
+            // the REVOKING value at [SQUASH], above.  In that case we 
+            // just retry the revocation operation.
+            v = obj->LockWord
+            if v != REVOKING (Self) 
+                continue ; 
+            if CAS (&obj->LockWord, REVOKING(Self), UNBIAS(v)) != v
+                 continue
+            return 
+                
+
+*   [V3E]
+
+    --  Requires a dedicated per-thread page.
+        The thread-specific pages must be immortal and TSM.
+
+    --  Requires a dedicated and distinguished "REVOKING" lockword value.
+        REVOKING is a reserved encoding. 
+        
+    --  V3D requires unique per-thread REVOKING(t) values whereas V3E
+        requires just a single distinguished REVOKING value.   
+        Compared to V3D, however, V3E must hold RevMux for a much longer 
+        period in Revoking().
+
+    --  [TAG:QRLMPROTECT:QD-BTB] 
+        [TAG:QRLMPROTECT:V3E]
+        Variation on QRLMPROTECT:QD
+        See also: QRLMPROTECT:SMP040109B
+
+    --  Possible optimizations:
+        We elide the mprotect() or Serialize() operations
+        in Revoke() if the system is a uniprocessor.
+
+    Lock (obj)
+        // Lockword mutator
+        Self->InCrit = obj
+        tmp = obj->LockWord
+        if (tmp == BIASUNLOCKED(Self)) {
+            obj->LockWord = BIASLOCKED(Self) ;      // [SQUASH] 
+            Self->InCrit = null ; 
+            return ; 
+        }
+        if (v == REVOKING) { 
+            Self->InCrit = null ; 
+            // Either spin waiting for obj->LockWord != REVOKING
+            // or simply retry the Lock() operation.  Retrying
+            // is tantamount to spinning.
+            retry ; 
+        }
+        ...
+       
+    Trap()
+        return
+
+    Revoke(obj)
+        // Replace the classic Dekker (ST InCrit;VMEMBAR;LD RevObj) with a 
+        // distinguished REVOKING lockword encoding.  We eliminate RevObj 
+        // and replace it with a distinguished value in obj->MarkWord.  
+        // The new entry/Lock protocol becomes (ST InCrit;VMEMBAR;LD LockWord)
+ 
+        for 
+            v = obj->LockWord
+            if v == REVOKING continue       // spin
+            t = BHT(v)
+            if t == null return 
+
+            // Exclude other revokers - restrict to one revoker.
+            // Restrict concurrency to BHT vs revoker (1v1). 
+            // With 1v1 we can use a Dekker-like algorithm.  
+            // The other source of concurrency w.r.t. the LockWord
+            // is the BHT vs the the single revoker.
+            // That is, only the BHT can mutate the LockWord.
+            pthreads_mutex_lock (t->RevMux) ; 
+            if CAS (&obj->LockWord, v, REVOKING) != v 
+                pthread_mutex_unlock (t->RevMux) ; 
+                continue ; 
+            }
+            MEMBAR
+            // Ensure that REVOKING is visible to the BHT.
+            // Equivalently: Serialize(t)
+            // See RFE 5079829
+            mprotect PageOf(t) RO
+            mprotect PageOf(t) RW
+
+            // Wait for the BHT to vacate the guarded critical section.
+            // The BHT won't reenter the critical section as REVOKING
+            // is now visible. 
+            while (t->InCrit == obj) ; 
+            MEMBAR #loadload
+            // Beware: a BHT-mutator could have stomped or overwritten
+            // the REVOKING value at [SQUASH], above.  In that case we 
+            // just retry the revocation operation.
+            v = obj->LockWord
+            if v != REVOKING 
+                pthreads_mutex_unlock (t->RevMux) ; 
+                continue ; 
+            if CAS (&obj->LockWord, REVOKING, UNBIAS(v)) != v
+                 pthreads_mutex_unlock (t->RevMux) ; 
+                 continue
+            return 
+                
+
+*   [V4] : Delay-based QRL
+
+    The following variant of QRL avoids MEMBARs and memory protection operations.
+    Instead, we assume quiescent consistency where a store will eventually
+    become visible after a certain amount of time.
+    
+    The program order of the Lock() operation is {ST InCrit, LD RevokeInProgress}.
+    Without an intervening MEMBAR the TSO memory model permits the LD to bypass 
+    the ST.  If such a reordering occurs then the ST might languish in the 
+    processors's write buffer while the LD executes.  The reordering opens a 
+    timing window where both a Lock()ing thread and some revoking thread enter 
+    the QRL critical section at the same time.
+
+    Specifically, the following scenario might occur.  In program order:
+    
+        Time    Revoker             Lock()ing thread
+        ----    -------             ----------------
+        1                           ST non-Zero into Self->InCrit
+        2                           LD Self->Revoking 
+        3       ST t->Revoking         
+        4       MEMBAR 
+        5       LD t->InCrit  
+            
+
+        At time (1) the ST languishes in the store buffer and is not yet
+        visible to other processors.
+        At time (2) the LD returns NULL/false.  The Locking() thread
+        enters the QRL critical section.  
+        At time (5) the LD returns NULL/false as the ST at time (1) is
+        not yet visible to the revoker.  The fetched value is stale.  
+        Both the revoking thread and the Lock()ing thread have entered
+        the QRL critical section at the same time.  Such loss of exclusion 
+        must be avoided.  
+
+    Note that if the race occurs then the LD at time(2) completed and 
+    fetched NULL and the ST at time (1) has retired, but is not yet visible 
+    to the revoker.  Since the LD at time(1) completed we know that all prior
+    instructions, including the ST at (1) are "committed".  The ST will 
+    _eventually [29] become visible to a revoker.  By inserting a sufficient delay 
+    between (4) and (5) we can ensure that any ST from time (1) will be visible
+    at (5).  Cf. [15] "Timed Consistency" or eventual consistency.
+
+    Put another way, a precondition for the race is that the LD at (2)
+    fetches NULL.  If the LD fetches NULL then we know that the ST at (1)
+    is committed and will eventually become visible.  
+
+    Delay-based QRL
+    ~~~~~~~~~~~~~~~ 
+
+      Lock (Object)
+        Retry:
+          // ST InCrit then LD RevokeInProgess with no intervening MEMBAR.
+          Self->InCrit = Object       
+          if Self->RevokeInProgress == Object
+              Self->InCrit = NULL
+              Delay() 
+              goto Retry
+          
+          // critical section ...
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              // Exit the QRL critical section
+              Self->InCrit = NULL     
+              return success
+          Self->InCrit = NULL
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord) return
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object
+              MEMBAR()
+              DelayForMaximumStoreBufferLatency()  
+              while (BiasHolder->InCrit == Object) SPIN(); 
+              Object->LockWord = UNBIAS (Object->LockWord)
+              BiasHolder->RevokeInProgress = NULL
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+
+    Remarks
+    -------
+
+    -   We need to ensure the LD of Self->RevokeInProgess in Lock(), above,
+        can't be satisfied by a look-aside into the store buffer.
+        To prevent this we can establish the invariant that either the
+        Lock()ing thread never STs into RevokeInProgress, or if it does,
+        that it insures that a MEMBAR occurs between the ST and the LD
+        in Lock().  
+
+    -   The actual delay interval in DelayForMaximumStoreBufferLatency()
+        is system-dependent.   The delay exists and is bounded for any system.
+        If the delay is set too short the revoker and the revokee can
+        race, resulting in an exclusion failure.  If the delay is too
+        long we introduce unnecessary latency in the Revoke() operation.
+
+    -   The thread executing Revoker() does not have to be idle during the 
+        "DelayForMaximumStoreBufferLatency" interval -- it can 
+        accomplish other useful work.
+
+
+    In general the delay-based and mprotect()-based mechanisms operate
+    on the following principle.  The bias-holding-thread executes
+    {ST Self->InCrit; LD Self->Revoking} with no intervening memory
+    barrier instruction.  The ST can reorder with the LD such that
+    the LD completes while the ST is pending and is not yet visible to
+    other processors.  This scenario - which we want to prevent - can 
+    lead to exclusion failure.  The mechanism used by the revoker -- 
+    mprotect(), signals, cross-calls, context-switching -- ensures that 
+    if the bias-holding-thread is executing in the key ST;LD sequence that 
+    either the ST into Self->InCrit will become visible to the revoker *or*
+    that the subsequent LD of Self->Revoking by the bias-holding-thread will
+    observe the non-NULL value previously set the revoking thread.
+
+*   [V5] JNI barriers and state transitions based on page-permissions
+
+    -   Each thread has a private dedicated virtual page which contains its 
+        InJava flag.  The sole variable in the page is the InJava field.  
+        Permissions on the page can be changed via mprotect().  
+        The Thread's "Slot" variable points to the thread's page.
+        In this case the "Halt" flag is encoded in the permissions
+        of the thread's page.
+
+    JNIReentry()
+        // If the ST traps, control vectors into TrapHandler().
+        ST 1, Self->Slot->InJava
+        
+    TrapHandler()
+        Wait for any concurrent collection to complete
+        return ;        // retry the ST
+
+    Collector()
+        // Stop-the-world
+        for each mutator thread t
+            mprotect pageof(t->Slot) READONLY
+            if t->Slot->InJava then StopMutatorCooperatively(t)
+        CollectJavaHeap()
+        for each mutator thread t
+            if !t->Slot->InJava then
+                mprotect pageof (t->Slot) READWRITE
+        
+    Remarks:
+    
+    -   To reduce the number of mprotect() system calls and the number of 
+        cross-calls we can group the per-thread InJava pages together into
+        contiguous sets.  One mprotect() operation can then set the permissions
+        for multiple InJava pages.  The loops in Collector(), above, could
+        be replaced with single or fewer mprotect() calls.
+
+        Collector()
+            mprotect all mutator InJava pages READONLY
+            for each mutator thread t
+                if t->Slot->InJava then StopMutatorCooperatively(t)
+            CollectJavaHeap ()
+            mprotect all mutator InJava pages READWRITE
+
+    -   This version supports both stop-the-world and stop-the-thread.
+        To erect the JNI barrier for an individual thread we simply 
+        mprotect(READONLY) the page containing the mutator's InJava flag.
+
+
+*   [V6] JNI barriers page-permissions - shared InCrit pages
+
+    The VM maintains a set of InJava "container" pages.  Each page is divided
+    into cache lines and each cache line is associated with at most one thread.  
+    A thread's InJava flag resides in the cache line associated with the thread.
+    (We divide the page into cache lines to prevent false sharing of the 
+    InJava fields).  The thread's "Slot" variable points to the thread's cache 
+    line which resides in one of the container pages.  Multiple threads may
+    share a given page.
+
+    JNIReentry()
+        ST 1, Self->Slot->InJava
+        
+    TrapHandler()
+        Wait for any concurrent collection to complete
+        return ;        // retry the ST
+
+    Collector()
+        // stop-the-world
+        mprotect all InJava container pages READONLY
+        CollectJavaHeap ()
+        mprotect all InJava container pages READWRITE
+
+    Remarks:
+
+    -   This version improves on [V5] in that collector will need
+        to mprotect() many fewer pages for a stop-the-world collection
+
+    -   Stop-the-thread collection is impractical with this version.
+        Since the container pages are shared -- containing the InJava flags
+        for multiple thread -- if the collector changes the protection of 
+        the container associated with one thread, it can cause other unrelated
+        threads to trap in JNIReentry().
+
+
+*   [V7] JNI barriers - back-to-back mprotect
+
+    -   Similar to V4, each thread has a private InJava page
+
+    JNIReentry()
+        ST 1, Self->Slot->InJava
+        LD Self->Halt
+        if non-zero goto StopSelf
+        
+    TrapHandler()
+        Wait for any concurrent collection to complete
+        return ;        // retry the ST
+
+    Collector()
+        // stop-the-world
+        for each mutator thread t
+            t->Halt = 1 
+            MEMBAR()
+            mprotect pageof(t->Slot) READONLY
+            mprotect pageof(t->Slot) READWRITE
+            if t->Slot->InJava then StopMutatorCooperatively(t)
+        CollectJavaHeap ()
+        for each mutator thread t
+            t->Halt = 0 
+            Wake the mutator if it is blocked in TrapHandler()
+
+    Remarks
+    -------
+
+    -   Compared to versions V5 and V6, this version will reduce the 
+        trap rate as the pages are mprotect-ed READONLY only for a brief
+        interval.  
+
+    -   To further reduce the trap rate we can enhance JNIReentry to 
+        opportunistically check Self->Slot before storing into 
+        Self->Slot->InJava.   This optimization does not eliminate traps, 
+        but it greatly reduces the timing window where trap might occur.
+
+        JNIReentry()
+            LD Self->Halt                   // optimization ...
+            if non-zero goto StopSelf       // optimization ...
+            ST 1, Self->Slot->InJava
+            LD Self->Halt
+            if non-zero goto StopSelf
+        
+
+    -   This mechanism is analogous to QRL [V3] described above.  
+
+    -   This version supports both stop-the-thread and stop-the-world collectors.  
+
+*   [V8] JNI barriers - back-to-back mprotect with shared inCrit pages
+
+    This version uses shared InJava pages similar to version V6.
+    The mutators and collectors use a protocol similar to that used
+    in version in V7.
+
+    JNIReentry()
+        ST 1, Self->Slot->InJava
+        LD Self->Halt
+        if non-zero goto StopSelf
+        
+    TrapHandler()
+        Wait for any concurrent collection to complete
+        return ;        // retry the ST
+
+    Collector()
+        // stop-the-world
+        for each mutator thread t
+            t->Halt = 1 
+        MEMBAR()
+        mprotect all mutator InJava pages READONLY
+        mprotect all mutator InJava pages READWRITE
+        for each mutator thread t
+            if t->Slot->InJava then StopMutatorCooperatively(t)
+        CollectJavaHeap ()
+        for each mutator thread t
+            t->Halt = 0 
+            Wake the mutator if it is blocked in TrapHandler()
+
+    -   To further reduce the trap rate we can enhance JNIReentry to speculatively
+        check Self->Slot before storing into Self->Slot->InJava.   This optimization
+        does not eliminate traps, but it greatly reduces the timing window where
+        trap might occur.
+
+        JNIReentry()
+            LD Self->Halt                   // optimization ...
+            if non-zero goto StopSelf       // optimization ...
+            ST 1, Self->Slot->InJava
+            LD Self->Halt
+            if non-zero goto StopSelf
+        
+
+    -   This version supports both stop-the-thread and stop-the-world collectors.  
+        To stop an individual thread we must mprotect(READONLY) the shared page
+        which contains the thread's InJava flag.  While the page is READONLY
+        other threads which share the page could attempt to store into their
+        InJava fields, generating a trap.  This is "false trap" in that the
+        trapping thread was not being stopped.  To tolerate false traps we can
+        take one of the following measures:
+
+        a.  A thread incurring a false trap could block in its TrapHandler(), waiting
+            for the memory protections on the shared page to be restored.
+            Note that the collector sets the page permissions to READONLY and then
+            immediately restores the protections to READWRITE.  As such, the delay
+            waiting for the permissions to return to READWRITE should be short.
+
+        b.  A thread incurring a false trap could proactively restore the protections
+            of the shared page to READWRITE with mprotect().  The thread could then
+            proceed, restarting the trapping ST instruction.  There is no loss
+            of exclusion. 
+
+        c.  The trap handler would deflect control into an alterate JNIReentry
+            path that used "ST;MEMBAR;LD Self->Halt".  Variously, the ST 
+            instruction in the alternate path could store into Self->InJava 
+            via an alternate READWRITE virtual mapping, or the ST could be 
+            performed to an alternate set of InJava flags. 
+            (Viz., ST 1, Self->AltInJava).  
+
+
+*   [V9] Context-switching 
+
+    We replace the mprotect() operations  with delays, signals or 
+    forced context switching.  
+
+    For example if the collector has access to a schedctl-like interface 
+    (through which the collector can determine the last CPU on which the mutator 
+    was dispatched and the current scheduling state of the mutator) then we can 
+    optimize a stop-the-world collection as follows:
+
+    JNIReentry()
+        ST 1, Self->InJava
+        LD Self->Halt
+        if non-zero goto StopSelf()
+
+    Collector()
+        for each cpuid
+            Flushed[cpuid] = 0
+        for each mutator thread t
+            t->Halt = 1
+
+        // Use context switching or migration to ensure that the
+        // mutator has serialized execution.   A context switch enforces 
+        // ordering/serialization a thread's instruction stream.
+        // Specifically, the switch enforces that the ST "happens before" 
+        // the LD and that no bypasses occur.  
+        // There are two possible cases: either the mutator has executed
+        // the ST or it has not yet executed the ST.  If the mutator has 
+        // executed past the ST then the switch guarantees that the ST is 
+        // now visible to the collector thread, otherwise if the mutator 
+        // has yet to execute the LD, the switch ensures that the LD will 
+        // observe the value STed by the collector.  
+        // That is, either the mutator's LD will observe the value STed by 
+        // collector or the collector's LD will observe the value STed
+        // by the mutator.  Either is sufficient.  
+
+        MEMBAR()
+        for each mutator thread t
+            if SCHEDCTL_ISEXECUTING(t) && !t->InJava then
+                cpuid = SCHEDCTL_CURRENTCPU(t)      // access schedctl sc_cpu
+                if (!Flushed[cpuid]) 
+                    Flushed[cpuid] = 1 ; 
+                    ContextSwitchTo (cpuid) ; 
+            else
+            if t->InJava
+               StopMutatorCooperatively (t)
+        CollectJavaHeap()
+        for each mutator thread t
+            t->Halt = 0 
+
+    The SCHEDCTL_ISEXECUTING and SCHEDCTL_CURRENTCPU primitives use the schedctl
+    subsystem or the Solaris "/proc" filesystem to inspect the mutator's scheduling
+    state.  
+
+    ContextSwitchTo() could be implemented in a number of ways:
+    
+    CST1: 
+
+        ContextSwitchTo() causes a context switch to a dedicated martyr thread. 
+        The martyr thread is "bound" to the CPU.  Each CPU on which mutators
+        might run has a dedicated and bounded martyr thread.  Binding can be
+        accomplished by sched_setaffinity() on linux, processor_bind() on Solaris,
+        and by SetThreadAffinityMask or SetProcessAffinityMask on windows.  
+
+        By using schedctl we bound to the number of context switches required in 
+        Collector() to at most the number of CPUs instead of the number of mutator 
+        threads.  As described above the ContextSwitchTo() operation is synchronous - 
+        it sends a message message to the martyr thread and then waits for a reply.
+        A simple refinement would be to build a list of processors and then iterate
+        over the list sending asynchronous messages.  The Collector would then enter 
+        a wait phase where it waited for a reply from each of the martyrs.  This 
+        refinement would improve parallelism.  (Multiple messages from the collector 
+        to martyrs would be in-flight simultaneously).  
+
+    CST2:
+        
+        ContextSwitchTo() transiently binds itself to the CPU on which the
+        mutator was last known to be running, potentially displacing the mutator.  
+        By context switching the collector onto the mutator's last-known CPU we
+        guarantee that the mutator has undergone a context switch and that the 
+        mutator's execution has been serialized (and all the mutator's prior ST 
+        operations are visible to the collector).
+
+    CST3:
+        
+        ContextSwitchTo() transiently binds the mutator to the CPU on
+        which the collector thread is running.  Again, this forces the mutator,
+        if running, to context switch and migrate to the collector's CPU.
+        Migration and context switching serialize execution.
+  
+*   [V10] JNI 
+ 
+    Each thread has private InJava and Halt fields. 
+    The JVM also provides a global "BarrierPage" virtual page.
+    HotSpot refers to this as the "serialization page" facility.  
+    Note that the per-thread Self->Halt variable could be replaced by a global 
+    "SafepointPending" if there was no requirement to stop only selected
+    individual threads.  
+    
+    JNIReentry()
+        // Ingress for external JNI code into managed runtime environment
+        // The ST into BarPage will trap into TrapHandler() if the page is READONLY.
+        ST 1, Self->InJava      ## Mark thread as normal mutator
+        ST 0, BarPage[(Self->ThreadID * CACHELINESIZE) & (PageSize-1)]
+        LD Self->Halt
+        if non-zero goto StopSelf
+
+    JNIReentry_SLOW()
+        ST 1, Self->InJava
+        MEMBAR
+        LD Self->Halt
+        if non-zero goto StopSelf
+        
+    TrapHandler()
+        Deflect control to JNIReentry_SLOW
+        return ;        // retry the ST
+
+    Collector()
+        // stop-the-world
+        for each mutator thread t
+            assert t->Halt == 0
+            t->Halt = 1 
+        PageArmed = TRUE
+        MEMBAR()
+        mprotect the single BarPage READONLY
+        mprotect the single BarPage READWRITE
+        PageArmed = FALSE
+        for each mutator thread t
+            if t->InJava then StopMutatorCooperatively(t)
+        CollectJavaHeap()
+        for each mutator thread t
+            t->Halt = 0 
+
+    Remarks:
+
+    -   This form supports both stop-the-world and stop-the-thread.
+        For stop-the-thread use unrelated threads can incur spurious
+        false-traps if the BarPage happens to be in READONLY state.
+        In this case the TrapHandler() can direct control flow
+        into JNIReentry_SLOW() which uses a traditional MEMBAR. 
+
+    -   A further optimization to reduce the rate of false-traps would
+        be to change JNIReentry() to opportunistically check TrapArmed
+        before storing into BarPage.  This optimization does not completely
+        eliminate traps but it greatly reduces the timing window where
+        traps might occur.
+
+        JNIReentry()
+            LD TrapArmed
+            if non-zero goto JNIReentry_SLOW()
+            // The ST into BarPage will trap into TrapHandler() 
+            // if the page is READONLY.
+            ST 1, Self->InJava
+            ST 0, BarPage[(Self->ThreadID * CACHELINESIZE) & (PageSize-1)]
+            LD Self->Halt
+            if non-zero goto StopSelf
+
+    
+    -   In order to reduce cache line migration and false sharing we diffuse the 
+        stores into BarPage by conditioning the address with a thread-specific page 
+        offset. Note that we can precompute the expression:
+            Self->ThreadID * CACHELINESIZE) & (PageSize-1)
+
+    -   We have replaced the explicit MEMBAR in the classic JNIReentry()
+        routine with a dummy store to a potentially trapping page. 
+        If the mprotect(BarPage,READONY) is effective before a mutator STs 
+        into BarPage then the ST will trap and the mutator will be safely excluded
+        If the mprotect(BarPage,READONLY) is effective after a mutator STs
+        into BarPage then value STed into BarPage must be visible to the 
+        collector thread by virtue of the "TLB coherence" property.  Since
+        the ST to BarPage is visible, then by TSO we know that the mutator's
+        prior ST to Self->InJava will also be visible to the collector.
+
+    -   The reasoning behind the safety of this approach is rather subtle and 
+        deserves some additional commentary.   For brevity, lets assume we have 
+        just a single global "Halt" flag that the collector sets as it is trying to 
+        reach a safepoint and quiesce all Java mutator threads.  Furthermore, say 
+        we have just one Java thread, and that thread stores into an "InJava" flag 
+        to publish its state to the collector.   
+        
+        The "mprotect BarPage READONLY" operation establishes a global ordering on 
+        all stores to BarPage -- stores to barpage either come before or after the 
+        mprotect.  If the mutator's "ST BarPage" occurs before the collector's 
+        "mprotect BarPage READONLY", then by TSO we know that the mutator's 
+        "ST InJava=1" will be visible to the collector, In that case the mutator will 
+        continue into the JVM.  (The mutator "won" the race with the collector and will 
+        eventually rendezvous cooperatively of its own accord just like any other Java 
+        mutator thread.  That is, the collector will consider the mutator a normal Java 
+        thread and wait for it to rendezvous).  If the mutator's "ST BarPage" occurs 
+        after mprotect-READONLY and before mprotect-READWRITE then the mutator's ST 
+        into BarPage will trap.  That's serializing so again we're safe.  If the 
+        mutator's "ST BarPage" occurs after the mprotect-READONLY and the 
+        mprotect-READWRITE then the memory model in conjunction with the 
+        "strong mprotect" property (see below) tell us that that the mutator's 
+        subsequent "LD Halt" will observe 1  at least as long as the collector is 
+        safepointing.  The collector considers the mutator to be outside the 
+        managed runtime environment but the mutator, having observed Halt != 0, 
+        will stall itself and avoid ingress while the collector is collecting.  
+        
+        In more detail, "ST BarPage" occurred after the collector's mprotect-READONLY, 
+        mprotect-READWRITE (by global mprotect ordering), which itself occurred after 
+        the collector's MEMBAR, which occurred after the collector's "ST Halt=1" 
+        (by collector program order).  So we know the collector's "ST Halt=1 happens 
+        before (and is visible before) the mutator's "ST BarPage" instruction _issues.  
+        But of course the mutator is executing "ST InJava=1 ; ST BarPage; LD Halt" in 
+        program order, and the "ST BarPage" could have reordered with the subsequent 
+        "LD Self->Halt" in architectural memory order.  Typically, this might occur 
+        because the processor issues in order, but the ST languishes in the processor's 
+        local store buffer, in which case the "ST Self->InJava=1 ;LD Self->Halt" in 
+        program order could legally reorder to "LD Self->Halt; ST InJava=1" in 
+        memory order.  The "strong mprotect" property tells us that the mutator's 
+        "LD Halt" couldn't have been in-flight at the time of the collector's 
+        mprotect-READONLY operation.  (Or if it was in-flight, it was annulled 
+        and replayed transparently).  Given that, we know that the mutator's "LD Halt" 
+        will observe the "ST Halt=1" executed by the collector, so the mutator will 
+        correctly stall itself and avoid ingress.  
+        
+        Lets restate the above with the key partial orderings :
+        ">>" is the transitive "happens after" relation and "<<" is happens-before.  
+        
+        1. ST BarPage (memory order) >> mprotect BarPage,RO  
+           [by global ST ordering to BarPage imposed by mprotect]
+        
+        2. mprotect BarPage,RO >> MEMBAR  
+           >> ST Halt=1  (memory order)
+           >> ST Halt=1  (program order)
+           [By TSO and program order]
+        
+        3. ST BarPage (memory order) >> ST Halt=1 (memory order)
+           [because >> is transitive]
+        
+        4. ST BarPage (memory order) >> ST BarPage (program order)
+           [by program order]
+        
+        5. ST BarPage (program order) >> mprotect BarPage READONLY
+           [by strong mprotect property]
+        
+        6. LD Halt (memory order) >> LD Halt (program order)
+           [by program order]
+        
+        Given all that, we have
+        
+          ST Halt=1 (memory order)
+          << mprotect BarPage READONLY [by PO+TSO]
+          << ST BarPage (program order) [by strong mprotect]
+          << LD Halt  (program order) [by program order]
+          << LD Halt  (memory order) [by program order)
+        
+        So we have "ST Halt=1" (memory)" << "LD Halt" (memory)".  Thus the 
+        "LD Halt" instruction in the mutator will correctly observe the "ST Halt=1"  
+        executed by the collector.  
+        
+        
+*   [V11] JNI 
+
+    - Each Java thread has a private InJava field.
+
+    - The JVM provides a global BarPage (Barrier Page) and a
+      NeedToStop variable.  
+
+    - This variant supports stop-the-world, but not stop-the-thread.
+
+    - The test of NeedToStop in JNIReentry() is not required, but
+      acts as an optimization to decrease the taken trap rate.
+
+    - The mprotect(BarPage) operation imposes a global ordering
+      on STs to the BarPage.  That is, all STs are well-ordered.
+      A ST to the BarPage either happens before the mprotect (READYONLY) or after.
+      If the ST executes before, it will be visible by the time the mprotect()
+      returns.  If the ST happens after the mprotect(READONLY), the ST will
+      trap.
+
+    JNIReentry()
+        // The ST into BarPage will trap into TrapHandler() if the page is READONLY.
+        ST 1, Self->InJava
+        LD NeedToStop                   // optimization to decrease trap rate
+        if non-zero goto StopSelf       // ""
+        nop                             // ""
+        ST 0, BarPage[(Self->ThreadID * CACHELINESIZE) & (PageSize-1)]
+
+    JNIReentry_SLOW()
+        ASSERT Self->InJava == 1
+        MEMBAR
+        LD NeedToStop
+        if non-zero goto StopSelf
+        
+    TrapHandler()
+        Deflect control to JNIReentry_SLOW
+        return ;        // retry the ST
+
+    Collector()
+        // stop-the-world
+        NeedToStop = 1 
+        MEMBAR()
+        mprotect the single BarPage READONLY
+        for each mutator thread t
+            if t->InJava then StopMutatorCooperatively(t)
+        CollectJavaHeap()
+        mprotect BarPage READWRITE
+        NeedToStop = 0 
+
+*   [V12] mprotect()-based Dekker
+
+    -   Enhanced versions of [BASICMPROTECT]
+
+    -   Allow FastThread exiting critical section
+        that incurs a trap on {ST 0,A} to switch the
+        page to READWRITE and make progress without
+        waiting for the SlowThread to switch the page 
+        back to READWRITE.
+
+        FastThread:
+            ST 1, A
+            <CriticalSection>
+            ST 0, A
+
+        TrapHandler:
+            if (FaultingAddress == &A && A == 1) { 
+                mprotect PageOf(A) READWRITE
+                A = 2
+                MEMBAR() 
+                Adjust interrupted IP to skip ST
+                return
+            }
+
+        SlowThread:
+            for (;;) { 
+                while (A == 1) Delay() ; 
+                if (A == 2) CAS (&A, 2, 0) ; 
+                mprotect PageOf(A) READONLY
+                if (A == 0) break ; 
+                mprotect PageOf(A) READWRITE
+                BackOffDelay () ; 
+            }
+            <CriticalSection>
+            mprotect PageOf(A) READWRITE
+
+    -   Use an auxiliary helper variable "Trp" to
+        indicate that the fastthread switched the page
+        back to READWRITE.  
+
+        FastThread:
+            ST 1, A
+            <CriticalSection>
+            ST 0, A
+
+        TrapHandler:
+            if (FaultingAddress == &A && A == 1) { 
+                mprotect PageOf(A) READWRITE
+                Trp = 1 ; 
+                MEMBAR() ; 
+                return ;        // retry trapping ST
+            }
+
+        SlowThread:
+            for (;;) { 
+                while (A) Delay() ; 
+                if (VARIATION) Trp = 0 ;        // optional optimization
+                mprotect PageOf(A) READONLY
+                if (A == 0) {
+                    if (Trp) { Trp = 0 ; continue ; }
+                    break ; 
+                }
+                mprotect PageOf(A) READWRITE
+                BackOffDelay () ; 
+            }
+            <CriticalSection>
+            mprotect PageOf(A) READWRITE
+
+    -   Allow A to take on 3 values: 0, 1, 2. 
+        2 indicates that the slow-thread is attempting to enter its critical 
+        section.  Concurrent fast-thread traffic can stomp A from 2 to 0 or 1, 
+        causing the slow-thread to retry.  Frequent fast-thread traffic can
+        indefinitely impede or deny a slow-thread.
+
+        FastThread:
+            ST 1, A
+            <CriticalSection>
+            ST 0, A
+
+        TrapHandler:
+            if (FaultingAddress == &A && A == 1) { 
+                mprotect PageOf(A) READWRITE
+                return ;        // retry trapping ST
+            }
+
+        SlowThread:
+            for (;;) { 
+                while (A) Delay() ; 
+                if CAS (&A, 0, 2) != 0 continue ; 
+                mprotect PageOf(A) READONLY
+                if (A == 2) break ; 
+                mprotect PageOf(A) READWRITE
+                BackOffDelay () ; 
+            }
+            <CriticalSection>
+            mprotect PageOf(A) READWRITE
+            CAS (&A, 2, 0) ; 
+
+    -   Similar to [V3B]
+        A = Fast-thread InCrit
+        B = Slow-thread InCrit
+        The use of "B" is optional, but avoids excessive trap rates.
+        This form works with either strong- or weak-mprotect semantics.
+
+        FastThread:
+            ST 1, A                
+            LD B                // optional optimization to avoid excessive traps
+            bnz ...             // ""
+            ST Page
+            <CriticalSection>
+            ST 0, A
+
+        TrapHandler:
+            MEMBAR
+            return to FastThread
+
+        SlowThread:
+            ST 1, B
+            MEMBAR
+            mprotect Page READONLY
+            LD A
+            bnz ...
+            <CriticalSection>
+            mprotect Page READWRITE
+            ST 0, B
+             
+
+
+Miscellany
+~~~~~~~~~~
+
+*   For clarity of exposition the techniques above were described with 
+    respect to a Java Virtual Machine.   The ideas are also 
+    applicable to managed environments other than Java, such as 
+    Microsoft's .NET CLR (Common Language Runtime).  
+
+*   The mutual exclusion mechanisms described above are also applicable
+    to POSIX pthreads mutexes [8].
+
+*   For brevity of exposition we assume TSO or stronger although a 
+    practitioner skilled in the art will realize that TSO is not required
+    for all the examples included herein.
+
+*   For JNI stop-the-world serialization, it may be better to 
+    provide primitives to serialize *all* processors, instead of
+    iteratively serializing each thread with SERIALIZE(t).
+
+*   Regarding the Java Memory Model (JSR133) and QRL
+
+    The JMM requires that if thread A executes { .. ST X; Unlock L;}  and 
+    thread B subsequently executes { Lock L; LD X; } that the ST into X
+    performed by A must be visible to B at the time of the LD. 
+
+    Lets say L was biased toward A.  The (Unlock L) operation performed
+    by A will change the lockword variable associated with L from
+    BIASLOCKED(A) to BIASUNLOCKED(A).  That is, A's unlock operation
+    performs a ST of BIASUNLOCKED(A) into the lockword. 
+
+    If B concurrently or subsequently attempts (Lock L), the Lock operator
+    executed by B will LD the lockword and observe one of the following 
+    values:
+
+    1.  BIASLOCKED(A) 
+        In this case B's Lock attempt came before the A's unlock or
+        before A's unlock became visible.  In either case, B will
+        attempt to revoke A's bias.  The revoke action will ensure that
+        any latent STs performed by A will be visible to B. 
+    
+    2.  BIASUNLOCKED(A)
+        In this case B will attempt to revoke the bias from A and convert L's
+        lockword from BIASUNLOCKED(A) to NORMALUNLOCKED.
+        Recall that A executed {ST X; ST BIASUNLOCKED(A) into lockword;}
+        Since B observed that the lockword is BIASUNLOCKED(A) we know by TSO
+        that A's ST into X is also visible to B.  
+
+    Thus our mechanism satisfies the JMM.
+
+*   We need to be careful not to make assumptions about the implementation of
+    mprotect. Specifically, mprotect() isn't always guaranteed to perform a 
+    cross-call so unless we've clever we can't depend on it to stand in as 
+    "remote membar".  Some operating systems such as Solaris optimize 
+    mprotect() to restrict the x-calls to only those CPUs that might have the 
+    associated TLB entry loaded. Second, there are mprotect/shoot-down
+    optimizations that take advantage of lazy permission promotion.  
+    
+    Lets say a thread on CPU#1 calls mprotect(NONE) on a RW page that's mapped
+    by other CPUs.  Typically, the kernel will x-call to the other CPUs to
+    shoot-down the TLB and downgrade the permissions.  This all happens 
+    synchronously, before mprotect() returns.  The thread on CPU#1 then calls
+    mprotect(READWRITE) on the same page.  In this case the kernel can skip 
+    the x-calls.  The key point is that the *physical* permission on the page 
+    & TLB must be a subset of the *virtual* permissions.  If a thread on 
+    another CPU happens to reference the page, the LD or ST will trap and the
+    kernel will quietly promote or upgrade the physical permissions in the TLB. 
+    Assuming that there were no intervening remote references, if the thread on CPU#1 
+    calls mprotect(NONE) the kernel may be able to optimize the operation and
+    avoid any x-calls. 
+    
+    As a warning, our mechanism must be designed to rely on TLB coherence
+    properties, and *not* on any imputed TLB shoot-down cross-calls 
+    (interprocessor interrupts).  Such cross-calls would certainly serialize
+    execution, but we're not guaranteed that the operating will generate a 
+    cross-call for each mprotect() request.  
+
+*   On large systems, mechanisms that use synchronous cross-calls, such as 
+    mprotect()-based forms, can prove a scalability impediment.  
+    The cross-call, in a sense, constitutes a system-wide global critical 
+    section
+
+*   Beware that various processor vendors ascribe different meanings
+    to the following terms related to the phases of instruction flow :
+    issue; dispatch; execute; commit; complete; retire
+
+
+Appendix - suggested Solaris serialization API
+~~~~~~~~
+
+*   SerializeOneCPU (c)
+    SerializeAll ()
+    SerializeOneThread (t)
+    SerializeCPUs (CpuList[])
+    CPUOF(t) -> c or (-1)
+
+*   The implementation would be x-call based.  CPUOF(t) and 
+    SerializeOneThread() would use schedctl to eliminate x-calls
+    for threads that are OFFPROC.  
+
+Appendix - Strong-mprotect and weak-mprotect (READONLY) semantics
+~~~~~~~~
+
+    Modern processors that support out-of-order execution or speculative
+    execution may have a number of instructions in-flight at any one time.
+    (Some literature uses the term "in the issue window" to mean the
+    same as "in flight").  The instructions retire in program order and given TSO,
+    stores become visible in program order.  The in-flight window consists of the 
+    set of instructions that the processor is currently executing.     
+    
+    A platform provides *strong mprotect* if mprotect(READONLY) meets the 
+    following criteria:
+
+    1.  The mprotect(READONLY) operation signals all remote processors
+        that might be accessing the page to serialize execution.
+        The mprotect() call will not return until all remote processors
+        finish serialization. And,
+
+    2.  When a remote processor is signaled to serialize execution
+        it picks some point in program order as the serialization 
+        point.  STs prior to the serialization point commit and become 
+        visible.  The serialization point must, of course, be past the last
+        visible ST in program order.   The processor discards all
+        speculative state for instructions past the serialization point.
+        (Such instructions are in-flight -- the processor rolls-back
+        execution to the serialization point).  The processor then 
+        resumes execution at the serialization point.  If the processor
+        re-runs a ST to the offending page and the page is still
+        READONLY the ST will trap.  If the processor re-runs a ST
+        and the page is again READWRITE the ST may commit.
+        The mprotect() call can not return until all remote processors
+        acknowledge that serialization is completed.  
+
+        An equivalent way of restating (2) is to say that a ST
+        in flight at the time of an mprotect(READONLY) must either 
+        (a) commit and become visible, or
+        (b) trap, or
+        (c) be annulled, discarding any speculative state subsequent 
+            in program order to the ST. 
+
+    3.  Protection traps are precise, flush the store buffer before 
+        control enters the trap handler, and roll-back or annul any 
+        speculative execution past the trapping point.
+
+    In all cases the processor must complete instructions in-order 
+    (in program order).  A ST is allowed to complete and become visible 
+    IFF all prior instructions in program order complete.
+
+    *Weak mprotect* is the same as strong-mprotect except that 
+    STs in-flight are permitted to persist over concurrent
+    remote mprotect(READONLY) operations.  
+
+    Any operating system that implements TLB coherency with shoot-downs
+    (cross-calls) provides strong mprotect.  Solaris/SPARC, for example, 
+    uses cross-calls to remove WRITE permissions from stale TLBs.  
+    The cross-call interrupt serializes execution and flushes the 
+    recipient's store buffer to memory before the interrupt handler runs.
+    In addition, if the particular implementation of a processor validates 
+    the permissions of a store *before* the store enters the store buffer 
+    and the store buffer contains only committed stores (and no in-flight
+    stores) then the platform also meets the strong mprotect() criteria.  
+
+    Note that many "lazy" TLB optimizations remain permissible under 
+    strong-mprotect.  (Such optimizations usually try to avoid or reduce the
+    number of cross-calls).  For example lets say processor C1 has a READONLY 
+    TLB entry for a certain page.  Processor C2 calls mprotect(READWRITE) on 
+    that page.  The operating system may skip the cross-calls from C2 to C1.  
+    Later, if C1 stores into the page the ST will fault.   The fault causes 
+    the store buffer to flush.  The trap handler can quitely invalidate/update 
+    TLBs and processor-local page tables to upgrade the permissions to READWRITE
+    and then restart the instruction.  Deferred upgrades (upgrade on-demand) are
+    also  permissible.  Critically, the *actual* page permissions of a TLB or 
+    page-table entry must always be a subset of the virtual page permissions 
+    (those set by the last mprotect call).   If a page is virtually READWRITE, 
+    but all TLB entires that map the page are READONLY, the mprotect(READONLY) 
+    can also avoid cross-calls.
+
+    If the platform implements only weak-mprotect then the following 
+    scenario, using the code from V7 or V8, above, can occur:
+        
+        Lets say our hypothetical processor has a store buffer, but the
+        store buffer contains (virtual address,data) pairs.  The address 
+        hasn't been translated or checked for protections.  We'll call these
+        STs "in-flight".  The store buffer is a strict FIFO.  Translation and 
+        validation happen as elements are removed from the store buffer.  
+        If the ST generates an exception then the processor discards the contents
+        of the FIFO and rolls-back execution accordingly.  (Clearly the 
+        micro-architectural storage requirements in the CPU to roll-back state 
+        over a long sequence of instructions could be extremely large).  
+
+        Our pathological scenario would be:
+  
+        Time Thread         Action 
+        ---- ------         ------
+
+        1:   Mutator    :   ST INJAVA, Self->ThreadState   
+        2:                  LD NeedToSTop (observes 0)                 
+             Collector  :   ST 1 into NeedToStop
+                            MEMBAR
+                            mprotect pageof(ThreadState) READONLY
+                            mprotect pageof(ThreadState) READWRITE
+        3:                  LD mut->ThreadState (observes !INJAVA)           
+        4:   Mutator    :   ---                   
+        5:                  ---                      
+        
+        [1] the store transfers into the store buffer.  
+            The ST is In-flight.
+        [2] the mutator fetches 0
+        [3] the collector fetches the mutator state and observes !INJAVA 
+            The store performed in [1] is not yet visible to the collector.  
+        [4] the store of INJAVA into Self->ThreadState in step [1] commits
+            (the protection check passes because the page is again READWRITE).
+        [5] the store of INJAVA into Self->ThreadState becomes visible
+
+        This scenario results in loss of exclusion -- the mutator is mutating
+        while collector collects.   This condition, "inscape", can occur only 
+        if the processor does not support strong-mprotect() -- the processor
+        permits a ST to remain in-flight over a concurrent mprotect(READONLY)
+        operation.  
+
+        The strong-mprotect property would guarantee that the ST at [1] can't
+        remain in-flight over the mprotect(READONLY) operation.  The ST would 
+        have to either trap, commit and become visible before the mprotect() returns,
+        or be annulled.  (in the case of annulment the processor would
+        roll-back control in the mutator to the ST at [1] or before).
+    
+    To avoid this pathology on platforms that support only weak-mprotect 
+    we can adapt the mprotect()-based protocols so that
+    the revoking thread changes the pages permissions to READONLY
+    and the locking thread later restores the permissions on its 
+    own page to READWRITE.   Critically, only the locking thread will
+    restore its VPage to READWRITE.  
+    
+    As an optimization to avoid excessive traps on the ST into 
+    Self->VPage->InCrit we implement a per-thread PageIsRO advisory
+    field to track the current permissions on the page.  By checking 
+    PageIsRO before storing into VPage the locking thread can greatly
+    reduce the window where the ST might trap.  The PageISRO field
+    is strictly an optimization.  PageIsRO admits some races or timing
+    windows where the field does not match the current permissions.
+    If PageisRO is incorrect the outcome is benign.  
+
+    QRL - adapted for weak-mprotect(READONLY)
+    -----------------------------------------
+    
+      Lock (Object)
+          // Enter QRL critical section
+        Retry:
+          if (Self->PageIsRO) { 
+              // Slow-path
+              Self->PageIsRO = 0 ; 
+              MEMBAR() ; 
+              mprotect BiasHolder->VPage READWRITE
+              // Revert to traditional ST:MEMBAR:LD
+              Self->VPage->InCrit = Object       
+              MEMBAR() ; 
+              if (Self->RevokeInProgress) {      // Excluded ? 
+                 Self->VPage->InCrit = NULL
+                 Delay ()                       
+                 // back-off.  Consider using a Dekker-like "turn" 
+                 // variable to arbitrate and avoid live-lock.
+                 goto Retry ; 
+              }
+          } else { 
+              // Fast-path ...
+              // Note that we ST into InCrit and then LD from 
+              // RevokeInProgress with no intervening MEMBAR.
+              // The ST to InCrit can trap into TrapHandler
+              Self->VPage->InCrit = Object       
+              if Self->RevokeInProgress == Object
+                 Self->VPage->InCrit = NULL
+                 goto Retry
+          }
+          
+          // critical section ... 
+          // Inspect the lock-word.  If it is BIASUNLOCKED(Self) 
+          // then change it to BIASLOCKED(Self).
+          // Note that the operation is CAS-like.  
+
+          tmp = Object->LockWord
+          if tmp == BIASEDUNLOCKED(Self)
+              Object->LockWord = BIASEDLOCKED(Self)
+              // Exit the QRL critical section
+              // The ST to InCrit can trap into TrapHandler
+              Self->VPage->InCrit = NULL     
+              return success
+          Self->VPage->InCrit = NULL
+          if ISBIASEDBYOTHERTHREAD(tmp)
+              Revoke (Object)
+          if ISFIRSTLOCK(tmp)
+              // Attempt to bias the object toward Self.
+              if CAS(&Object->LockWord, tmp, BIASEDLOCKED(Self) == tmp) 
+                  return success
+          ... continue into traditional Lock code ...  
+      
+      Revoke (Object)
+          LockWord = Object->LockWord
+          if !ISBIASED(LockWord)
+          BiasHolder = BIASEDTOWARD(LockWord)
+          pthread_mutex_lock (BiasHolder->RevokeMutex)
+          Verify = Object->LockWord
+          // Re-sample the lockword.  It could have changed from BIASED to
+          // non-biased state. Only the first revoker performs 
+          // revocation.  When the 1st revoker resamples the lock-word it will
+          // still see the object in BIASED state.  Subsequent revoke attempts
+          // (revoking threads) will notice that the lockword changed to non-BIASED 
+          // and return quickly.
+          if ISBIASED(Verify) AND BIASEDTOWARD(Verify) == BiasHolder
+              BiasHolder->RevokeInProgress = Object
+              BiasHolder->PageIsRO = Object
+              MEMBAR()
+              mprotect BiasHolder->VPage READONLY
+              while (BiasHolder->VPage->InCrit == Object) SPIN(); 
+              Object->LockWord = UNBIAS (Object->LockWord)
+              BiasHolder->RevokeInProgress = NULL
+          pthread_mutex_unlock (BiasHolder->RevokeMutex)
+      
+      TrapHandler()
+          // On Unix or Linux the TrapHandler() would be implemented with signals.
+          // On Windows the TrapHandler() would be implemented with either
+          // structured exception handling (SEH) or vectored exception handling (VEH).
+          // We return immediately, simply retrying the offending ST.  
+          mprotect Self->VPage READWRITE
+          Self->PageIsRO = FALSE ; 
+          MEMBAR()
+          if (Self->VPage->InCrit != NULL) { 
+              Self->VPage->InCrit = NULL ;
+          }
+          MEMBAR()
+          while (Self->RevokeInPress != NULL) SPIN() ; 
+          return ; 
+
+Appendix - OFFPROC implies serialized
+~~~~~~~~
+
+*   If a thread's schedctl sc_state indicates OFFPROC, then it's user-mode
+    execution has been serialized.  Likewise, any changes to 
+    a thread's sc_state or sc_cpu fields indicate that the thread 
+    has serialized execution.
+
+*   The only stores to sc_cpu and sc_state are in kernel-mode, and
+    are performed by the thread itself.  The only way out of
+    user-mode and into kernel-mode is via a trap.  (A voluntary
+    trap or an involuntary trap).  Traps serialize execution.  
+    
+    Consider fast thread "F":
+        user-mode: ST into A
+        trap from user-> kernel
+        kernel-mode: ST OFFPROC into sc_state   [KSO]
+
+    Slow thread "S"
+        Fetch F's sc_state and observe OFFPROC 
+        LD A
+
+    If the ST into sc_state is visible @ KSO is visible to S, then
+    by TSO and trap invariants the value that F STed into A will
+    also be visible to S
+
+Appendix - a taxonomy of serialization mechanisms
+~~~~~~~~
+    
+*   Intervention - the blocking thread forces the putative owner to serialize.
+    Intervention must be *synchronous*.  Intervention can not complete until
+    the remote CPU acknowledges that it has serialized execution.
+
+    =   Signals or ACBs from the blocking thread to the putative owner.
+        Signals are difficult because:
+        a.   platform-specific
+        b.   The JVM proper is signal-safe, but a thread in the JVM could
+             "escape" to signal-unsafe foreign code via JNI.
+             We could prevent a thread from escaping the managed environment
+             with pending signals, but that might slow up the JNI transitions. 
+    =   Signals to bound martyrs
+    =   use synchronous xcalls from the blocking thread to the putative owner.
+        AKA: cross-calls, x-calls, x-traps, inter-processor interrupts, IPIs [28][33].
+        The cross-call must be synchronous - control must not return to the 
+        caller until the callee has serialized.
+    =   Suspension
+
+*   Restartable critical sections. 
+    Signals or ACBs that examine the interrupted EIP and if needed
+    restart non-atomic {LD-Test-Br-Modify-ST} critical sections that
+    access the lockword.  This approach is clever and permits a light-weight
+    accessor protocol (no need for Self->InCrit, for example) but we may need 
+    to stack-walk in the case of nested signals.  The user-mode EIP takes
+    the place of the explicit Self->InCrit field.
+
+*   Passive waiting:
+    =   Have a blocking thread spin for at least MAXSTLATENCY nsecs after having
+        STed into "m.Queue".
+        The blocking thread knows that a lateny ST of null to Owner,
+        if such a ST exists, will eventually become visible -- in finite time.
+        IDEA: merge ST-visibility spin with normally spin-to-acquire
+    =   the blocking thread uses a timed wait/park.
+        at most one blocking thread uses a timed wait, and then
+        for at most MAXSTLAT nsecs.
+    =   Arrange for each CPU to periodically serialize and increment a ThisCPU->Serialize counter.
+        The contending thread waits/polls until it observes the CPUOF(Owner)->Serialize counter 
+        change.
+        CPUTICK() { MEMBAR; SelfCPU->SerializeCounter++; }  
+
+*   Safepoints:
+    permit the blocking thread to force the owner to a safepoint.
+    Use STW or STT safepoints.  STT are preferred.
+    =   STT per-thread safepoints (not currently available in hotspot)
+    =   STW global JVM safepoints (not viable)
+
+*   Context-switching.
+    Depends on the "OFFPROC implies serialized" property.
+    =   IPC round-trip message to martyr bound to CPUOF(Owner).
+    =   Push displacement : transiently bind blocking thread to CPUOF(putative Owner).
+        Displace the putative owner OFFPROC by forcibly migrating the contending thread onto the 
+        Owner's last known-CPU.  
+    =   Pull displacement : transiently bind putative owner to CPUOF(blocking thread).
+        Alternately, forcibly but transiently bind the putative owner off it's last known CPU.
+
+*   In some cases if the race caused by a missing MEMBAR is benign and
+    results in stranding, then we could implement a strand-checker
+    thread that periodically iterates over all threads.  The strand-checker 
+    wakes up potentially stranded threads to give them to recover.  
+
+*   TLB coherence property via mprotect() : code, global or thread-specific pages.
+    =   mprotect RO putative owner's "serialization" page.
+        +   global page shared by multiple threads:  Threads->page Many-to-fewer mapping.
+        +   page associated uniquely 1:1 with putative (observed) owner
+    =   mprotect RO pageof (objectMonitor)
+    =   mprotect thread-specific code ? 
+    =   mprotect code - (bad idea on solaris!)
+    =   mprotect thread-specific code.  Requires indirect control transfer.
+
+*   variation: Accelerate with schedctl sc_state and sc_cpu.
+    We can avoid serializing an owner thread if the contending thread observes
+    that the Owner's sc_state is OFFPROC.
+
+
+
+References
+~~~~~~~~~~
+    
+[1]   The SPARC Architecture Manual, Version 9.
+      Weaver, Germond
+      SPARC International, Prentice-Hall, 1994.
+
+[2]   Algorithms for Mutual Exclusion
+      M. Raynal
+      MIT Press, 1986 
+
+[3]   The JSR-133 Cookbook for Compiler Writers
+      http://gee.cs.oswego.edu/dl/jmm/cookbook.html
+      (An excellent reference for memory models and consistency).
+
+[4]   Quickly Reacquirable Locks (Biased Locking)
+      David Dice, Mark Moir, Bill Scherer.  
+    
+      http://home.comcast.net/~pjbishop/Dave/QRL-OpLocks-BiasedLocking.pdf
+
+[5]   Lamport on Mutual Exclusion: 27 Years of Planting Seeds 
+      J. Anderson 
+      Proceedings of the 20th Annual ACM Symposium on Principles of
+      Distributed Computing (PODC).  August 2001.
+      http://www.cs.unc.edu/~anderson/papers/lamport.pdf
+
+[6]   A fast mutual exclusion algorithm
+      Leslie Lamport 
+      ACM Transactions on Computer Systems (TOCS) Volume 5, Issue 1 (February 1987) 
+      http://doi.acm.org/10.1145/7351.7352
+
+[7]   Wait-free Synchronization
+      Maurice Herlihy
+      ACM Transactions on Programming Languages and Systems (TOPLAS) 
+      Volume 13, Issue 1.  January 1991
+      http://doi.acm.org/10.1145/114005.102808
+
+[8]   A Guide to Multithreaded Programming -- The Threads Primer
+      B. Lewis, D. Berg
+      Prentice Hall, 1996
+
+[9]   The Java Virtual Machine Specification
+      T. Lindholm, F. Yellin
+      Addison-Wesley 1997
+
+[10]  Solaris Internals - Core Kernel Architecture
+      J. Mauro, R McDougall
+      Prentice-Hall, 2001.
+
+[11]  The ia64-Linux Kernel - Design and Implementation
+      D. Mosberger, S. Eranian
+      Prentice-Hall, 2002.
+
+[12]  An On-the-fly Reference Counting Garbage Collector for Java. 
+      Yossi Levanoni and Erez Petrank. 
+      ACM Conference on Object-Oriented Programming, Systems, Languages, and Applications.
+      (OOPSLA'01). October, 2001.   
+
+[13]  On-the-Fly Cycle Collection Revisited
+      Harel Paz, David F. Bacon, Elliot K. Kolodner, Erez Petrank, and V.T. Rajan 
+      http://www.research.ibm.com/people/d/dfb/papers/Paz03OnTheFly.pdf
+
+[14]  An efficient meta-lock for implementing ubiquitous synchronization. 
+      O. Agesen et al. 
+      ACM SIGPLAN International Conference on Object-Oriented Programming Systems, 
+      Languages and Applications (OOPSLA), 1999.    
+
+[15]  Timed Consistency for Shared Distributed Objects
+      Torres-Rojas, Ahamad, Raynal
+      PODC 1999.
+
+[16]  Correctly Implementing Value Prediction in MicroProcessors that
+      Support Multithreading or Multiprocessing
+      M Martin, D Sorin, M Cain, M Hill, H Lipasti
+      IEEE/ACM 34th Annual Symposium on MicroArchitecture
+      Dec 2001
+
+[17]  Deconstructing Commit
+      G Bell, M Lipasta
+      Proc 4th International Symposium on Performance Analysis of Systems and Software 
+      (ISPASS-4), Austin, TX, March 2004
+
+[18]  The IBM eServer z990 Microprocessor
+      T. Slegal, E Pfeffer, J. Magee
+      IBM Journal of Research and Development V48, N3/4.  May/July 2004. 
+      (Data Cache Loads and Stores)
+
+[19]  Memory Ordering: a Value-Based Approach
+      H. Cain, M. Lipasti
+
+[20]  Java Locks: Analysis and Acceleration by Kiyokuni Kawachiya
+      PhD Dissertation -- 2005.
+      www.trl.ibm.com/people/kawatiya/Kawachiya05phd.pdf 
+      See Chapter 5, "Asymmetric Lock"
+      See Chapter 6, "Lock Reservations"
+
+[21]  A New Fast-Path Mechanism for Mutual Exclusion
+      J. Anderson and Y.-J. Kim (James Anderson, UNC)
+      Distributed Computing , Volume 14, Number 1, pp. 17-29, January 2001
+      http://www.cs.unc.edu/~anderson/papers/dc00.pdf
+
+[22]  Shared-memory Mutual Exclusion: Major Research Trends Since 1986 
+      J. Anderson, Y.-J. Kim, and T. Herman, 
+      Distributed Computing , Volume 16, pages 75-110, 2003. 
+      Special issue celebrating the 20th anniversary of PODC.  
+      http://www.cs.unc.edu/~anderson/papers/survey.pdf
+      (Search for fast-path or fast path).  
+
+[23]  One-sided Mutual Exclusion: a New Approach to Mutual Exclusion Primitives.
+      Christian Siebert
+      Chemnitz University of Technology
+      CSR-04-05
+      July 2004
+
+[24]  On the Effectiveness of Speculative and Selective Memory Fences
+      Oliver Trachsel,  Christoph von Praun,  Thomas Gross,  
+      Proceedings of the 20th International Parallel and Distributed Processing Symposium 
+      (IPDPS 2006), April 2006
+
+[25]  Conditional Memory Ordering
+      Christoph von Praun, Trey Cain, Jong-Deok Choi, and Kyung Ryu. 
+      International Symposium on Computer Architecture (ISCA), June 2006.
+
+[26]  Read-Copy Update (RCU), Paul McKenney
+      http://www.rdrop.com/users/paulmck/RCU
+      http://en.wikipedia.org/wiki/RCU
+        
+      RCU and biased locking share the goal of avoiding high-latency
+      atomic operations, although RCU goes much further and allows
+      more forms of sharing.   
+
+[27]  OpenSolaris sources - mutex.c mutex_exit() optimization
+      http://cvs.opensolaris.org/source/xref/onnv/onnv-gate/usr/src/uts/common/os/mutex.c#71
+      
+[28]  FlushProcessWriteBuffers() - implemented with inter-processor interrupts. 
+
+[29]  Eventual consistency model      
+
+[30]  How to implement unnecessary Mutexes
+      Mike Burrows
+
+[31]  Fast Synchronization for Quasi-immutable objects
+      Nishiyama
+      SPE 2007
+
+[32]  Lock Reservations Reconsidered
+      Kawachiya, et al.
+      ECOOP 2004
+
+[33]  NTQuerySystemInformation()
+      It is believed that current implementations of NtQuerySystemInformation()
+      use broadcast IPIs to read the performance counters form all CPUs. 
+
+[34]  http://swsblweb1.central.sun.com:8080/CrPrint?id=5079829
+      Solaris RFE for a serialization API
+
+[35]  TO-Lock: Removing Lock Overhead Using the Owners' Temporal Locality
+      PACT 2004
+      Takeshi Ogasawara, Hideaki Komatsu, and Toshio Nakatani, 
+
+[36]  Lock Reservation: Java Locks Can Mostly Do Without Atomic Operations
+      OOPSLA 2002
+      Kiyokuni Kawachiya, Akira Koseki, and Tamiya Onodera 
+
+[37]  Shasha & Snir : Delay sets
+
+[38]  force_mb_all_threads() : used by user-mode RCU
+
+[39]  QPI quiesence
+      On modern core-i7 920 Intel Nehalem systems with QPI (Quick-Path Interconnect)
+      atomic operations that span cache lines will quiesce the whole interconnect.
+      Empirical results suggest that, while not defined by the architecture, the 
+      Intel implementation of such split atomics can be used as a "remote mfence",
+      say in place of mprotect-like tricks.  
+      http://blogs.oracle.com/dave/QPI_quiescence
+
+
+
+
+
+
+
+
+
+
+      
+
+
+        
+
+
+
+
+
